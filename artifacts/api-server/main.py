@@ -1655,12 +1655,18 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 820px) {
       .topbar { align-items: flex-start; flex-wrap: wrap; }
       .top-status { margin-left: auto; }
+      .tabs {
+        min-width: 0; max-width: 100%; overflow-x: auto;
+        -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      }
+      .tabs::-webkit-scrollbar { display: none; }
+      .tab { flex: 0 0 auto; white-space: nowrap; }
       .workspace { grid-template-columns: 1fr; }
       .side-panel { position: static; }
     }
     @media (max-width: 520px) {
+      body { overflow-x: clip; }
       .tabs { width: 100%; order: 3; }
-      .tab { flex: 1; }
       .lookup-bar { flex-direction: column; }
       .data-grid { grid-template-columns: 1fr; }
       .data-card.wide { grid-column: auto; }
