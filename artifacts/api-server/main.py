@@ -1534,7 +1534,7 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(7, 11, 20, .68); backdrop-filter: blur(18px);
       position: sticky; top: 0; z-index: 5;
     }
-    .brand { display: flex; align-items: center; gap: 12px; min-width: 220px; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 220px; cursor: pointer; }
     .brand-mark {
       width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px;
       background: linear-gradient(135deg, var(--blue), var(--cyan));
@@ -1673,7 +1673,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <div class="shell">
     <header class="topbar">
-      <div class="brand">
+      <div class="brand" onclick="document.querySelector(&quot;[data-view='lookup']&quot;).click()" title="Back to home">
         <div class="brand-mark">D</div>
         <div><div class="brand-name">DIGITSCOPER</div><div class="brand-sub">Desktop intelligence engine</div></div>
       </div>
