@@ -653,6 +653,52 @@ def lookup(number: str) -> dict[str, Any]:
     return lookup_record(number)
 
 
+def _safe_json(raw: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+@app.get("/history")
+@app.get("/api/history")
+def history() -> dict[str, Any]:
+    """Return recent lookup history, most recent first."""
+    items: list[dict[str, Any]] = []
+    with connection() as db:
+        rows = db.execute(
+            "SELECT number, carrier, spam, region, first_seen, last_seen, lookup_count "
+            "FROM lookups ORDER BY last_seen DESC LIMIT 50"
+        ).fetchall()
+    for row in rows:
+        carrier = _safe_json(row["carrier"])
+        spam = _safe_json(row["spam"])
+        region = _safe_json(row["region"])
+        items.append({
+            "number": row["number"],
+            "carrier": carrier.get("name") or "Unknown",
+            "line_type": carrier.get("line_type") or carrier.get("type") or "",
+            "fraud_score": spam.get("score"),
+            "risk_label": spam.get("label") or "",
+            "city": region.get("city") or "",
+            "state": region.get("state") or "",
+            "first_seen": row["first_seen"],
+            "last_seen": row["last_seen"],
+            "lookup_count": row["lookup_count"],
+        })
+    return {"items": items}
+
+
+@app.delete("/history")
+@app.delete("/api/history")
+def clear_history() -> dict[str, Any]:
+    """Clear the local lookup history ledger."""
+    with connection() as db:
+        result = db.execute("DELETE FROM lookups")
+        return {"cleared": result.rowcount}
+
+
 @app.get("/area-codes")
 @app.get("/api/area-codes")
 def area_codes() -> dict[str, Any]:
@@ -1592,6 +1638,8 @@ INDEX_HTML = r"""<!doctype html>
     .badge { display: inline-flex; padding: 5px 9px; border-radius: 99px; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; font-weight: 800; }
     .badge-blue { color: var(--blue); background: rgba(93,184,255,.12); }
     .badge-green { color: var(--cyan); background: rgba(108,227,218,.11); }
+    .badge-red { color: var(--danger); background: rgba(255,125,150,.12); }
+    .badge-amber { color: #f5b544; background: rgba(245,181,68,.12); }
     .data-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     .data-card { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 12px; padding: 15px; }
     .data-card.wide { grid-column: 1 / -1; }
@@ -1636,6 +1684,13 @@ INDEX_HTML = r"""<!doctype html>
     .admin-output { margin-top: 20px; max-height: 280px; overflow: auto; }
     .db-row { display: flex; justify-content: space-between; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
     .db-row span:last-child { color: var(--muted); }
+    .history-list { margin-top: 6px; border: 1px solid var(--line); border-radius: 14px; background: rgba(23, 34, 55, .48); overflow: hidden; }
+    .history-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--line); padding: 12px 14px; color: var(--text); cursor: pointer; font-family: inherit; }
+    .history-row:last-child { border-bottom: none; }
+    .history-row:hover { background: rgba(93, 184, 255, .06); }
+    .history-number { font-weight: 750; font-size: 14px; }
+    .history-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+    .history-empty { padding: 26px 14px; text-align: center; color: var(--muted); font-size: 13px; }
     .bulk-ingestion { margin-top: 26px; border: 1px solid var(--line); border-radius: 14px; background: rgba(23, 34, 55, .48); overflow: hidden; }
     .bulk-ingestion summary { cursor: pointer; padding: 16px; color: var(--text); font-size: 13px; font-weight: 750; }
     .bulk-ingestion summary::marker { color: var(--blue); }
@@ -1710,7 +1765,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="tab" data-view="bulk">Bulk Lookup</button>
         <button class="tab" data-view="fraud">Fraud Network</button>
         <button class="tab" data-view="pricing">Pricing</button>
-        <button class="tab" data-view="admin">Admin</button>
+        <button class="tab" data-view="history">History</button>
       </nav>
       <div class="top-status"><span class="dot"></span> Local engine online</div>
     </header>
@@ -1852,6 +1907,16 @@ INDEX_HTML = r"""<!doctype html>
           <div id="pricing-status" class="status" role="status" style="margin-top:14px;"></div>
           <p class="hint" style="margin-top:10px;">After checkout, sign in on the <strong>Pro</strong> tab with the same email you paid with.</p>
         </div>
+        <div id="view-history" class="view">
+          <div class="eyebrow">Lookup history</div>
+          <h2>Your past scans.</h2>
+          <p class="intro">Every scan is cached in your private SQLite engine. Tap a row to re-run it.</p>
+          <div id="history-status" class="status" role="status"></div>
+          <div id="history-list" class="history-list"></div>
+          <div style="margin-top:14px;">
+            <button id="history-clear-button" class="btn btn-muted">Clear history</button>
+          </div>
+        </div>
         <div id="view-admin" class="view">
           <div class="eyebrow">Local administration</div>
           <h2>Inspect the engine ledger.</h2>
@@ -1932,11 +1997,66 @@ INDEX_HTML = r"""<!doctype html>
       updateAreaCodeOptions();
     }
     $("pattern-state").addEventListener("change", updateAreaCodeOptions);
-    document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => {
+    function showView(name) {
       document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
       document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
-      tab.classList.add("active"); $("view-" + tab.dataset.view).classList.add("active");
+      const tab = document.querySelector(".tab[data-view='" + name + "']");
+      if (tab) tab.classList.add("active");
+      const view = $("view-" + name);
+      if (view) view.classList.add("active");
+    }
+    document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => {
+      if (location.hash) history.replaceState(null, "", location.pathname);
+      showView(tab.dataset.view);
+      if (tab.dataset.view === "history") loadHistory();
     }));
+    // Hidden admin access: digitscoper.onrender.com/#admin
+    function openFromHash() { if (location.hash === "#admin") showView("admin"); }
+    window.addEventListener("hashchange", openFromHash);
+    openFromHash();
+    // ---------- History ----------
+    function riskBadge(score, label) {
+      const cls = score >= 75 ? "badge badge-red" : score >= 40 ? "badge badge-amber" : "badge badge-green";
+      return "<span class='" + cls + "'>" + esc(label || (score + "/100")) + "</span>";
+    }
+    async function loadHistory() {
+      const list = $("history-list");
+      setStatus("history-status", "Loading history...");
+      try {
+        const data = await request("/history");
+        const items = data.items || [];
+        setStatus("history-status", items.length ? items.length + (items.length === 1 ? " scan" : " scans") + " on record." : "");
+        list.innerHTML = items.length ? items.map((item) => {
+          const place = [item.city, item.state].filter(Boolean).join(", ");
+          const meta = [item.carrier, item.line_type, place].filter(Boolean).join(" · ");
+          const when = item.last_seen ? new Date(item.last_seen).toLocaleString() : "";
+          const scans = item.lookup_count > 1 ? " · " + item.lookup_count + " scans" : "";
+          return "<button class='history-row' data-number='" + esc(item.number) + "'>" +
+            "<span><span class='history-number'>" + esc(item.number) + "</span>" +
+            "<span class='history-meta'>" + esc(meta) + (when ? "<br>" + esc(when) + esc(scans) : "") + "</span></span>" +
+            riskBadge(item.fraud_score ?? 0, item.risk_label) +
+            "</button>";
+        }).join("") : "<div class='history-empty'>No lookups yet.<br>Scan a number to get started.</div>";
+      } catch (error) {
+        setStatus("history-status", error.message, true);
+        list.innerHTML = "";
+      }
+    }
+    $("history-list").addEventListener("click", (event) => {
+      const row = event.target.closest(".history-row");
+      if (!row) return;
+      $("lookup-number").value = row.dataset.number;
+      document.querySelector("[data-view='lookup']").click();
+      runLookup();
+    });
+    $("history-clear-button").addEventListener("click", async () => {
+      if (!confirm("Clear all lookup history? This cannot be undone.")) return;
+      try {
+        const data = await request("/history", { method: "DELETE" });
+        setStatus("history-status", "Cleared " + data.cleared + " record" + (data.cleared === 1 ? "" : "s") + ".");
+        loadHistory();
+      } catch (error) { setStatus("history-status", error.message, true); }
+    });
     async function runLookup() {
       const number = $("lookup-number").value.trim();
       if (!number) return setStatus("lookup-status", "Enter a number to scan.", true);
