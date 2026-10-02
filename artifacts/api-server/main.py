@@ -1841,6 +1841,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="eyebrow">Unified phone lookup</div>
           <h1>See the signal<br>behind the number.</h1>
            <p class="intro">Run a live IPQualityScore scan across carrier, line status, business, risk, and reputation signals. Results are cached in your private SQLite engine for the next pass.</p>
+           <p class="hint" style="margin: 2px 0 0;">Only shows numbers actually scanned in Digitscoper. No fake records.</p>
           <div class="lookup-bar">
             <input id="lookup-number" type="text" inputmode="tel" placeholder="+1 (415) 555-0198" aria-label="Phone number">
             <button id="lookup-button" class="btn btn-primary">Run scan</button>
