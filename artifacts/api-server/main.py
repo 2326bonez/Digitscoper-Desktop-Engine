@@ -1663,6 +1663,20 @@ INDEX_HTML = r"""<!doctype html>
       .tab { flex: 0 0 auto; white-space: nowrap; }
       .workspace { grid-template-columns: 1fr; }
       .side-panel { position: static; }
+      /* Compact admin view on mobile */
+      #view-admin .eyebrow { font-size: 9px; }
+      #view-admin h2 { font-size: 17px; margin: 6px 0 4px; }
+      #view-admin > p { font-size: 12px; line-height: 1.45; }
+      #view-admin .form-stack { gap: 8px; margin-top: 14px; }
+      #view-admin .form-stack h3 { font-size: 10px; margin-bottom: 6px; }
+      #view-admin input { padding: 9px 11px; font-size: 14px; }
+      #view-admin .btn { padding: 9px 13px; font-size: 13px; }
+      #view-admin .bulk-ingestion { margin-top: 14px; }
+      #view-admin .bulk-ingestion summary { padding: 11px 13px; font-size: 12px; }
+      #view-admin .bulk-ingestion-body { gap: 8px; padding: 0 13px 13px; }
+      #view-admin .bulk-ingestion-body textarea { min-height: 90px; padding: 9px 11px; font-size: 13px; }
+      #view-admin .admin-output { margin-top: 12px; max-height: 200px; }
+      #view-admin .db-row { padding: 7px 0; font-size: 11px; }
     }
     @media (max-width: 520px) {
       body { overflow-x: clip; }
@@ -1673,6 +1687,13 @@ INDEX_HTML = r"""<!doctype html>
       .result-head { align-items: flex-start; flex-direction: column; }
       .pattern-controls { grid-template-columns: 1fr; }
       .ingestion-summary { grid-template-columns: 1fr; }
+      /* Extra-compact admin view on phones */
+      #view-admin h2 { font-size: 15px; }
+      #view-admin .form-stack { margin-top: 10px; }
+      #view-admin input { padding: 8px 10px; }
+      #view-admin .btn { padding: 8px 11px; font-size: 12px; }
+      #view-admin .bulk-ingestion summary { padding: 9px 11px; }
+      #view-admin .bulk-ingestion-body textarea { min-height: 70px; }
     }
   </style>
 </head>
