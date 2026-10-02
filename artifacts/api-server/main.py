@@ -22,10 +22,13 @@ password (admin123).
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -38,10 +41,25 @@ from typing import Any, Optional
 
 import bcrypt
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+
+try:
+    import stripe
+    STRIPE_AVAILABLE = True
+except ImportError:
+    stripe = None  # type: ignore
+    STRIPE_AVAILABLE = False
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas as pdf_canvas
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from starlette.responses import HTMLResponse
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -49,6 +67,19 @@ DB_FILE = APP_DIR / "digitscoper.db"
 PORT = int(os.environ.get("PORT", "8000"))
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 IPQS_ENDPOINT = "https://ipqualityscore.com/api/json/phone"
+
+# --- Stripe billing configuration ---
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+STRIPE_PRO_PRICE_ID = os.environ.get("STRIPE_PRO_PRICE_ID", "").strip()
+STRIPE_PROPLUS_PRICE_ID = os.environ.get("STRIPE_PROPLUS_PRICE_ID", "").strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+if STRIPE_AVAILABLE and STRIPE_SECRET_KEY and stripe is not None:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+TIER_FREE = "free"
+TIER_PRO = "pro"
+TIER_PROPLUS = "pro_plus"
+VALID_TIERS = (TIER_FREE, TIER_PRO, TIER_PROPLUS)
 
 STATE_AREA_CODES: dict[str, dict[str, Any]] = {
     "AL": {"name": "Alabama", "area_codes": ["205", "251", "256", "334", "938"]},
@@ -170,8 +201,27 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(user_email, pattern)
             );
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                user_email TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                last_used TEXT
+            );
             """
         )
+        # --- tier column migration (replaces boolean is_pro) ---
+        user_columns = {
+            row["name"]
+            for row in db.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "tier" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
+            # migrate legacy is_pro flag -> tier
+            db.execute("UPDATE users SET tier = 'pro' WHERE is_pro = 1")
+            db.execute("UPDATE users SET tier = 'free' WHERE is_pro = 0 OR tier IS NULL OR tier = ''")
         saved_number_columns = {
             row["name"]
             for row in db.execute("PRAGMA table_info(saved_numbers)").fetchall()
@@ -190,8 +240,8 @@ def init_db() -> None:
         ).fetchone() is None:
             db.execute(
                 """
-                INSERT INTO users (email, password, is_pro, created_at)
-                VALUES (?, ?, 1, ?)
+                INSERT INTO users (email, password, is_pro, tier, created_at)
+                VALUES (?, ?, 1, 'pro', ?)
                 """,
                 ("ronald@example.com", hash_password("password123"), utc_now()),
             )
@@ -230,11 +280,32 @@ class AdminUserRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     user_password: str = Field(min_length=8, max_length=256)
     is_pro: bool = True
+    tier: str = Field(default="pro", max_length=16)
 
 
 class BulkIngestionRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
     numbers: str = Field(min_length=1, max_length=100000)
+
+
+class CheckoutRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    tier: str = Field(min_length=2, max_length=16)  # "pro" | "pro_plus"
+
+
+class BulkLookupRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    numbers: str = Field(min_length=1, max_length=100000)
+
+
+class FraudNetworkRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    numbers: str = Field(min_length=1, max_length=100000)
+
+
+class ApiKeyCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    name: str = Field(default="", max_length=80)
 
 
 app = FastAPI(
@@ -491,13 +562,45 @@ def lookup_record(number: str) -> dict[str, Any]:
         return live
 
 
-def require_pro(email: str) -> None:
+def get_user_tier(email: str) -> str:
+    """Return the subscription tier for a user, or 'free' if unknown."""
     with connection() as db:
         row = db.execute(
-            "SELECT is_pro FROM users WHERE lower(email) = lower(?)", (email,)
+            "SELECT tier, is_pro FROM users WHERE lower(email) = lower(?)", (email,)
         ).fetchone()
-    if row is None or not row["is_pro"]:
+    if row is None:
+        return TIER_FREE
+    tier = (row["tier"] or "").strip().lower()
+    if tier in VALID_TIERS:
+        return tier
+    # legacy fallback
+    return TIER_PRO if row["is_pro"] else TIER_FREE
+
+
+def set_user_tier(email: str, tier: str) -> None:
+    if tier not in VALID_TIERS:
+        raise ValueError(f"Invalid tier: {tier}")
+    with connection() as db:
+        db.execute(
+            "UPDATE users SET tier = ?, is_pro = ? WHERE lower(email) = lower(?)",
+            (tier, 1 if tier in (TIER_PRO, TIER_PROPLUS) else 0, email),
+        )
+
+
+def require_pro(email: str) -> str:
+    """Require Pro or Pro+ tier. Returns the user's tier."""
+    tier = get_user_tier(email)
+    if tier not in (TIER_PRO, TIER_PROPLUS):
         raise HTTPException(status_code=403, detail="Pro access required.")
+    return tier
+
+
+def require_proplus(email: str) -> str:
+    """Require Pro+ tier only. Returns the user's tier."""
+    tier = get_user_tier(email)
+    if tier != TIER_PROPLUS:
+        raise HTTPException(status_code=403, detail="Pro+ access required.")
+    return tier
 
 
 def dashboard_data(email: str) -> dict[str, Any]:
@@ -620,12 +723,15 @@ def pattern_search(area_code: str, suffix: str) -> dict[str, Any]:
 def pro_login(req: ProLoginRequest) -> dict[str, Any]:
     with connection() as db:
         row = db.execute(
-            "SELECT password, is_pro FROM users WHERE lower(email) = lower(?)",
+            "SELECT password, is_pro, tier FROM users WHERE lower(email) = lower(?)",
             (req.email,),
         ).fetchone()
     if row is None or not verify_password(req.password, row["password"]):
         raise HTTPException(status_code=403, detail="Invalid login.")
-    return {"status": "ok", "pro": bool(row["is_pro"]), "email": req.email}
+    tier = (row["tier"] or "").strip().lower()
+    if tier not in VALID_TIERS:
+        tier = TIER_PRO if row["is_pro"] else TIER_FREE
+    return {"status": "ok", "pro": tier in (TIER_PRO, TIER_PROPLUS), "tier": tier, "email": req.email}
 
 
 @app.post("/pro/save_number")
@@ -832,18 +938,560 @@ def admin_bulk_seed(req: BulkIngestionRequest) -> dict[str, Any]:
 def admin_add_user(req: AdminUserRequest) -> dict[str, Any]:
     admin_check(req.password)
     email = req.email.strip().lower()
+    tier = (req.tier or "").strip().lower()
+    if tier not in VALID_TIERS:
+        tier = TIER_PRO if req.is_pro else TIER_FREE
     with connection() as db:
         db.execute(
             """
-            INSERT INTO users (email, password, is_pro, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO users (email, password, is_pro, tier, created_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 password = excluded.password,
-                is_pro = excluded.is_pro
+                is_pro = excluded.is_pro,
+                tier = excluded.tier
             """,
-            (email, hash_password(req.user_password), int(req.is_pro), utc_now()),
+            (
+                email,
+                hash_password(req.user_password),
+                1 if tier in (TIER_PRO, TIER_PROPLUS) else 0,
+                tier,
+                utc_now(),
+            ),
         )
-    return {"status": "user_added", "email": email, "pro": req.is_pro}
+    return {"status": "user_added", "email": email, "pro": tier in (TIER_PRO, TIER_PROPLUS), "tier": tier}
+
+
+# =====================================================================
+# STRIPE BILLING
+# =====================================================================
+
+def _stripe_ready() -> bool:
+    return bool(STRIPE_AVAILABLE and STRIPE_SECRET_KEY)
+
+
+@app.post("/stripe/create-checkout")
+@app.post("/api/stripe/create-checkout")
+def stripe_create_checkout(req: CheckoutRequest) -> dict[str, Any]:
+    """Create a Stripe Checkout session for a Pro or Pro+ subscription."""
+    if not _stripe_ready():
+        raise HTTPException(status_code=503, detail="Stripe is not configured.")
+    tier = req.tier.strip().lower()
+    price_id = {TIER_PRO: STRIPE_PRO_PRICE_ID, TIER_PROPLUS: STRIPE_PROPLUS_PRICE_ID}.get(tier)
+    if not price_id:
+        raise HTTPException(status_code=400, detail="Invalid tier. Use 'pro' or 'pro_plus'.")
+    email = req.email.strip().lower()
+    try:
+        session = stripe.checkout.Session.create(  # type: ignore[union-attr]
+            mode="subscription",
+            customer_email=email,
+            line_items=[{"price": price_id, "quantity": 1}],
+            metadata={"email": email, "tier": tier},
+            success_url=os.environ.get("STRIPE_SUCCESS_URL", "/") + "?checkout=success",
+            cancel_url=os.environ.get("STRIPE_CANCEL_URL", "/") + "?checkout=cancelled",
+        )
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Stripe checkout failed: {error}") from error
+    return {"url": session.url, "session_id": session.id}
+
+
+@app.post("/stripe/webhook")
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request) -> dict[str, Any]:
+    """Verify the Stripe signature and fulfill subscription events."""
+    if not _stripe_ready():
+        raise HTTPException(status_code=503, detail="Stripe is not configured.")
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature", "")
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)  # type: ignore[union-attr]
+        else:
+            event = stripe.Event.construct_from(json.loads(payload), STRIPE_SECRET_KEY)  # type: ignore[union-attr]
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Invalid webhook signature: {error}") from error
+
+    event_type = event.get("type", "")
+    data_object = event.get("data", {}).get("object", {}) or {}
+
+    if event_type == "checkout.session.completed":
+        email = (data_object.get("metadata", {}) or {}).get("email") or data_object.get("customer_email") or ""
+        tier = (data_object.get("metadata", {}) or {}).get("tier", "").strip().lower()
+        if tier not in (TIER_PRO, TIER_PROPLUS):
+            tier = TIER_PRO
+        email = email.strip().lower()
+        if email:
+            with connection() as db:
+                exists = db.execute(
+                    "SELECT 1 FROM users WHERE lower(email) = lower(?)", (email,)
+                ).fetchone()
+                if exists:
+                    set_user_tier(email, tier)
+                else:
+                    # create the account on first successful payment; user sets
+                    # password via admin or a future self-serve flow
+                    db.execute(
+                        "INSERT INTO users (email, password, is_pro, tier, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (email, hash_password(secrets.token_hex(16)), 1, tier, utc_now()),
+                    )
+        return {"status": "fulfilled", "email": email, "tier": tier}
+
+    if event_type == "customer.subscription.deleted":
+        # downgrade: find by customer email when available
+        customer_id = data_object.get("customer")
+        email = ""
+        try:
+            if customer_id:
+                customer = stripe.Customer.retrieve(customer_id)  # type: ignore[union-attr]
+                email = (customer.get("email") or "").strip().lower()
+        except Exception:
+            email = ""
+        metadata = data_object.get("metadata", {}) or {}
+        email = email or (metadata.get("email") or "").strip().lower()
+        if email:
+            set_user_tier(email, TIER_FREE)
+        return {"status": "downgraded", "email": email}
+
+    return {"status": "ignored", "type": event_type}
+
+
+# =====================================================================
+# PRO EXPORTS (CSV / PDF)
+# =====================================================================
+
+def _pro_saved_numbers(email: str) -> list[dict[str, Any]]:
+    require_pro(email)
+    with connection() as db:
+        rows = db.execute(
+            """
+            SELECT number, carrier, line_type, region, business_name, created_at
+            FROM saved_numbers WHERE lower(user_email) = lower(?)
+            ORDER BY created_at DESC
+            """,
+            (email,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/pro/export/csv")
+@app.get("/api/pro/export/csv")
+def pro_export_csv(email: str = Query(..., min_length=3)) -> Response:
+    """Download the Pro user's saved numbers as CSV."""
+    rows = _pro_saved_numbers(email)
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=["number", "carrier", "line_type", "region", "business_name", "created_at"],
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="digitscoper-export.csv"'},
+    )
+
+
+def _render_pdf(rows: list[dict[str, Any]], email: str, tier: str) -> bytes:
+    """Render a PDF evidence report. Uses reportlab when available,
+    otherwise falls back to a minimal hand-built PDF."""
+    title = "Digitscoper Intelligence Report"
+    lines = [
+        title,
+        f"Generated: {utc_now()}",
+        f"Account: {email} ({tier})",
+        f"Saved numbers: {len(rows)}",
+        "",
+    ]
+    for row in rows:
+        lines.append(
+            f"{row.get('number','')} | {row.get('carrier','')} | "
+            f"{row.get('line_type','')} | {row.get('region','')} | "
+            f"{row.get('business_name','')}"
+        )
+    if REPORTLAB_AVAILABLE:
+        buffer = io.BytesIO()
+        doc = pdf_canvas.Canvas(buffer, pagesize=letter)
+        width, height = letter
+        doc.setTitle(title)
+        y = height - 60
+        doc.setFont("Helvetica-Bold", 16)
+        doc.drawString(50, y, title)
+        y -= 24
+        doc.setFont("Helvetica", 10)
+        for line in lines[1:]:
+            if y < 60:
+                doc.showPage()
+                y = height - 60
+                doc.setFont("Helvetica", 10)
+            for chunk in [line[i:i + 100] for i in range(0, len(line), 100)] or [""]:
+                doc.drawString(50, y, chunk)
+                y -= 14
+        doc.save()
+        return buffer.getvalue()
+    # --- minimal PDF fallback (valid single-page PDF) ---
+    text_ops = []
+    y = 750
+    for line in lines:
+        safe = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        text_ops.append(f"BT /F1 10 Tf 50 {y} Td ({safe}) Tj ET")
+        y -= 14
+    content = "\n".join(text_ops).encode("latin-1", errors="replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
+    ]
+    pdf = b"%PDF-1.4\n"
+    offsets = []
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref_pos = len(pdf)
+    pdf += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        pdf += f"{off:010d} 00000 n \n".encode()
+    pdf += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_pos}\n%%EOF"
+    ).encode()
+    return pdf
+
+
+@app.get("/pro/export/pdf")
+@app.get("/api/pro/export/pdf")
+def pro_export_pdf(email: str = Query(..., min_length=3)) -> Response:
+    """Download the Pro user's saved numbers as a PDF report."""
+    tier = require_pro(email)
+    rows = _pro_saved_numbers(email)
+    pdf_bytes = _render_pdf(rows, email, tier)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="digitscoper-report.pdf"'},
+    )
+
+
+# =====================================================================
+# PRO BULK LOOKUP
+# =====================================================================
+
+@app.post("/pro/bulk_lookup")
+@app.post("/api/pro/bulk_lookup")
+def pro_bulk_lookup(req: BulkLookupRequest) -> dict[str, Any]:
+    """Run live lookups across a batch of numbers. Pro: 50/batch, Pro+: 200/batch."""
+    tier = require_pro(req.email)
+    limit = 200 if tier == TIER_PROPLUS else 50
+    accepted, rejected = parse_bulk_targets(req.numbers)
+    batch = accepted[:limit]
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for number in batch:
+        try:
+            record = lookup_record(number)
+            results.append(
+                {
+                    "number": record["number"],
+                    "carrier": record["carrier"].get("name"),
+                    "line_type": record["carrier"].get("line_type"),
+                    "region": record["carrier"].get("region"),
+                    "city": record["region"].get("city"),
+                    "state": record["region"].get("state"),
+                    "country": record["region"].get("country"),
+                    "spam_score": record["spam"].get("score"),
+                    "spam_label": record["spam"].get("label"),
+                    "line_status": record.get("line_status", {}).get("label"),
+                    "business": record["business"].get("name"),
+                }
+            )
+        except HTTPException as error:
+            errors.append({"number": number, "reason": error.detail})
+        except Exception as error:  # noqa: BLE001 - batch must not abort on one failure
+            errors.append({"number": number, "reason": str(error)})
+    return {
+        "status": "bulk_lookup_complete",
+        "tier": tier,
+        "limit": limit,
+        "submitted": len(accepted),
+        "processed": len(batch),
+        "truncated": len(accepted) > limit,
+        "results": results,
+        "errors": errors,
+        "rejected": rejected,
+    }
+
+
+# =====================================================================
+# PRO+ FRAUD NETWORK DETECTION
+# =====================================================================
+
+def _number_attributes(record: dict[str, Any]) -> dict[str, str]:
+    """Extract the linkable attributes from a lookup record."""
+    digits = re.sub(r"\D", "", record.get("number", ""))
+    national = digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
+    area_code = national[:3] if len(national) >= 3 else ""
+    return {
+        "carrier": (record.get("carrier") or {}).get("name") or "Unknown",
+        "region": (record.get("carrier") or {}).get("region") or "Unknown",
+        "state": (record.get("region") or {}).get("state") or "Unknown",
+        "risk": (record.get("spam") or {}).get("label") or "Unknown",
+        "line_type": (record.get("carrier") or {}).get("line_type") or "Unknown",
+        "area_code": area_code,
+    }
+
+
+@app.post("/proplus/fraud_network")
+@app.post("/api/proplus/fraud_network")
+def proplus_fraud_network(req: FraudNetworkRequest) -> dict[str, Any]:
+    """Flagship Pro+ feature: detect linked fraud networks across a batch.
+
+    Numbers sharing 2+ attributes (carrier, region/state, risk label,
+    line type, area code) are linked; connected components become clusters.
+    """
+    require_proplus(req.email)
+    accepted, rejected = parse_bulk_targets(req.numbers)
+    batch = accepted[:200]
+
+    nodes: list[dict[str, Any]] = []
+    attrs: list[dict[str, str]] = []
+    for number in batch:
+        try:
+            record = lookup_record(number)
+        except Exception:  # noqa: BLE001 - skip numbers that fail live lookup
+            continue
+        attributes = _number_attributes(record)
+        attrs.append(attributes)
+        nodes.append(
+            {
+                "number": record["number"],
+                "carrier": attributes["carrier"],
+                "region": attributes["region"],
+                "state": attributes["state"],
+                "risk": attributes["risk"],
+                "risk_score": (record.get("spam") or {}).get("score"),
+                "line_type": attributes["line_type"],
+                "area_code": attributes["area_code"],
+                "business": (record.get("business") or {}).get("name"),
+            }
+        )
+
+    n = len(nodes)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    links: list[dict[str, Any]] = []
+    # Strong signals identify an operation; weak ones only corroborate.
+    strong_keys = ("carrier", "state", "risk")
+    weak_keys = ("line_type", "region", "area_code")
+    for i in range(n):
+        for j in range(i + 1, n):
+            shared_strong = [
+                key for key in strong_keys
+                if attrs[i][key] != "Unknown" and attrs[i][key] == attrs[j][key]
+            ]
+            shared_weak = [
+                key for key in weak_keys
+                if attrs[i][key] != "Unknown" and attrs[i][key] == attrs[j][key]
+            ]
+            # Link when: 2+ strong signals match, or 1 strong + 2 weak corroborate.
+            if len(shared_strong) >= 2 or (len(shared_strong) >= 1 and len(shared_weak) >= 2):
+                shared = shared_strong + shared_weak
+                union(i, j)
+                links.append(
+                    {
+                        "from": nodes[i]["number"],
+                        "to": nodes[j]["number"],
+                        "reason": "Shared " + ", ".join(shared),
+                        "shared_traits": shared,
+                    }
+                )
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    clusters: list[dict[str, Any]] = []
+    for cluster_id, (root, members) in enumerate(sorted(groups.items()), start=1):
+        if len(members) < 2:
+            continue
+        # traits shared by every member of the cluster
+        all_keys = strong_keys + weak_keys
+        common = [
+            key for key in all_keys
+            if all(attrs[m][key] != "Unknown" for m in members)
+            and len({attrs[m][key] for m in members}) == 1
+        ]
+        clusters.append(
+            {
+                "id": cluster_id,
+                "size": len(members),
+                "members": [nodes[m]["number"] for m in members],
+                "shared_traits": {key: attrs[members[0]][key] for key in common},
+                "threat": "HIGH" if any(
+                    nodes[m]["risk"] in ("High risk", "Suspicious") for m in members
+                ) else "WATCH",
+            }
+        )
+
+    # sort clusters by size, largest first
+    clusters.sort(key=lambda c: c["size"], reverse=True)
+
+    return {
+        "status": "fraud_network_complete",
+        "analyzed": n,
+        "submitted": len(accepted),
+        "rejected": rejected,
+        "nodes": nodes,
+        "links": links,
+        "clusters": clusters,
+        "cluster_count": len(clusters),
+        "linked_numbers": sum(c["size"] for c in clusters),
+    }
+
+
+# =====================================================================
+# PRO+ API KEYS
+# =====================================================================
+
+def _hash_api_key(plain_key: str) -> str:
+    return hashlib.sha256(plain_key.encode("utf-8")).hexdigest()
+
+
+def _validate_api_key(plain_key: str) -> Optional[dict[str, Any]]:
+    """Validate a bearer API key. Returns {user_email, tier} or None."""
+    key_hash = _hash_api_key(plain_key)
+    with connection() as db:
+        row = db.execute(
+            "SELECT user_email, id FROM api_keys WHERE key_hash = ?", (key_hash,)
+        ).fetchone()
+        if row is None:
+            return None
+        db.execute(
+            "UPDATE api_keys SET last_used = ? WHERE key_hash = ?", (utc_now(), key_hash)
+        )
+    tier = get_user_tier(row["user_email"])
+    if tier != TIER_PROPLUS:
+        return None
+    return {"user_email": row["user_email"], "tier": tier}
+
+
+async def _bearer_user(request: Request) -> dict[str, Any]:
+    """Extract and validate the Bearer API key for /api/v1/ routes."""
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer API key.")
+    plain_key = authorization[7:].strip()
+    user = _validate_api_key(plain_key)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or revoked API key.")
+    return user
+
+
+@app.post("/proplus/api_keys")
+@app.post("/api/proplus/api_keys")
+def proplus_create_api_key(req: ApiKeyCreateRequest) -> dict[str, Any]:
+    """Generate a new API key. The plain key is returned ONCE."""
+    require_proplus(req.email)
+    plain_key = "dsk_live_" + secrets.token_urlsafe(32)
+    key_hash = _hash_api_key(plain_key)
+    name = req.name.strip() or f"Key {utc_now()[:10]}"
+    with connection() as db:
+        cursor = db.execute(
+            """
+            INSERT INTO api_keys (key_hash, key_prefix, user_email, name, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (key_hash, plain_key[:12] + "...", req.email.strip().lower(), name, utc_now()),
+        )
+        key_id = cursor.lastrowid
+    return {
+        "status": "key_created",
+        "id": key_id,
+        "key": plain_key,
+        "name": name,
+        "warning": "Store this key now. It will never be shown again.",
+    }
+
+
+@app.get("/proplus/api_keys")
+@app.get("/api/proplus/api_keys")
+def proplus_list_api_keys(email: str = Query(..., min_length=3)) -> dict[str, Any]:
+    """List API keys (masked) for a Pro+ user."""
+    require_proplus(email)
+    with connection() as db:
+        rows = db.execute(
+            """
+            SELECT id, key_prefix, name, created_at, last_used
+            FROM api_keys WHERE lower(user_email) = lower(?)
+            ORDER BY created_at DESC
+            """,
+            (email,),
+        ).fetchall()
+    return {"keys": [dict(row) for row in rows]}
+
+
+@app.delete("/proplus/api_keys/{key_id}")
+@app.delete("/api/proplus/api_keys/{key_id}")
+def proplus_delete_api_key(key_id: int, email: str = Query(..., min_length=3)) -> dict[str, Any]:
+    """Revoke an API key."""
+    require_proplus(email)
+    with connection() as db:
+        cursor = db.execute(
+            "DELETE FROM api_keys WHERE id = ? AND lower(user_email) = lower(?)",
+            (key_id, email),
+        )
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="API key not found.")
+    return {"status": "key_revoked", "id": key_id}
+
+
+# =====================================================================
+# PUBLIC API v1 (Bearer token auth)
+# =====================================================================
+
+@app.get("/api/v1/lookup/{number}")
+async def api_v1_lookup(number: str, request: Request) -> dict[str, Any]:
+    """API-key authenticated single number lookup."""
+    await _bearer_user(request)
+    return lookup_record(number)
+
+
+@app.post("/api/v1/bulk_lookup")
+async def api_v1_bulk_lookup(req: BulkLookupRequest, request: Request) -> dict[str, Any]:
+    """API-key authenticated bulk lookup (up to 200 per batch)."""
+    user = await _bearer_user(request)
+    accepted, rejected = parse_bulk_targets(req.numbers)
+    results: list[dict[str, Any]] = []
+    for number in accepted[:200]:
+        try:
+            record = lookup_record(number)
+            results.append(
+                {
+                    "number": record["number"],
+                    "carrier": record["carrier"].get("name"),
+                    "line_type": record["carrier"].get("line_type"),
+                    "spam_score": record["spam"].get("score"),
+                    "spam_label": record["spam"].get("label"),
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            results.append({"number": number, "error": str(error)})
+    return {"user": user["user_email"], "processed": len(results), "results": results, "rejected": rejected}
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -1030,6 +1678,9 @@ INDEX_HTML = r"""<!doctype html>
       <nav class="tabs" aria-label="Primary navigation">
         <button class="tab active" data-view="lookup">Lookup</button>
         <button class="tab" data-view="pro">Pro</button>
+        <button class="tab" data-view="bulk">Bulk Lookup</button>
+        <button class="tab" data-view="fraud">Fraud Network</button>
+        <button class="tab" data-view="pricing">Pricing</button>
         <button class="tab" data-view="admin">Admin</button>
       </nav>
       <div class="top-status"><span class="dot"></span> Local engine online</div>
@@ -1096,6 +1747,21 @@ INDEX_HTML = r"""<!doctype html>
               <div id="pattern-results" class="pattern-results"></div>
             </div>
             <div class="stats"><div class="stat"><strong id="saved-number-count">0</strong><span>saved numbers</span></div><div class="stat"><strong id="saved-pattern-count">0</strong><span>saved patterns</span></div></div>
+            <div style="display:flex; gap:8px; margin-bottom:18px; flex-wrap:wrap;">
+              <button id="export-csv-button" class="btn btn-muted">⬇ Export CSV</button>
+              <button id="export-pdf-button" class="btn btn-muted">⬇ Export PDF Report</button>
+              <span id="tier-badge" class="badge badge-blue" style="align-self:center;"></span>
+            </div>
+            <div id="apikey-section" style="display:none; margin-bottom:18px; padding:16px; border:1px solid var(--line); border-radius:14px; background:rgba(23,34,55,.48);">
+              <h3>🔑 API Keys <span class="badge badge-green">Pro+</span></h3>
+              <p class="hint">Use keys with the <code>/api/v1/</code> endpoints. The full key is shown once at creation.</p>
+              <div class="lookup-bar">
+                <input id="apikey-name" placeholder="Key name (e.g. my-script)">
+                <button id="apikey-create-button" class="btn btn-primary">Create key</button>
+              </div>
+              <div id="apikey-new" class="status" style="word-break:break-all;"></div>
+              <div id="apikey-list" style="display:grid; gap:7px; margin-top:10px;"></div>
+            </div>
             <div class="form-stack">
               <label for="save-number">Save a number</label><div class="lookup-bar"><input id="save-number" placeholder="+1 415 555 0198"><button id="save-number-button" class="btn btn-muted">Save</button></div>
               <label for="save-pattern">Save a pattern</label><div class="lookup-bar"><input id="save-pattern" placeholder="415-555-*"><button id="save-pattern-button" class="btn btn-muted">Save</button></div>
@@ -1103,6 +1769,59 @@ INDEX_HTML = r"""<!doctype html>
             <h3>Numbers</h3><div id="saved-numbers" class="saved-list"></div>
             <h3>Patterns</h3><div id="saved-patterns" class="saved-list"></div>
           </div>
+        </div>
+        <div id="view-bulk" class="view">
+          <div class="eyebrow">Pro · Bulk lookup</div>
+          <h2>Scan numbers in batches.</h2>
+          <p>Pro: 50 per batch. Pro+: 200 per batch. Paste one number per line.</p>
+          <div class="form-stack" style="max-width:100%;">
+            <label for="bulk-numbers">Number batch</label>
+            <textarea id="bulk-numbers" style="width:100%; min-height:150px; resize:vertical; color:var(--text); background:#0a111e; border:1px solid var(--line); border-radius:10px; padding:13px 14px; font:inherit; line-height:1.5;" placeholder="+1 (415) 555-0198&#10;408-559-9314&#10;..."></textarea>
+            <button id="bulk-run-button" class="btn btn-primary">Run bulk scan</button>
+          </div>
+          <div id="bulk-status" class="status" role="status"></div>
+          <div id="bulk-results" style="margin-top:16px; overflow-x:auto;"></div>
+        </div>
+        <div id="view-fraud" class="view">
+          <div class="eyebrow">Pro+ · Fraud network detection</div>
+          <h2>Find the operation behind the numbers.</h2>
+          <p>Paste scam-call numbers. Digitscoper links numbers sharing carrier, state, risk and line signals — then maps the clusters so you can see the whole operation.</p>
+          <div class="form-stack" style="max-width:100%;">
+            <label for="fraud-numbers">Suspect number batch</label>
+            <textarea id="fraud-numbers" style="width:100%; min-height:150px; resize:vertical; color:var(--text); background:#0a111e; border:1px solid var(--line); border-radius:10px; padding:13px 14px; font:inherit; line-height:1.5;" placeholder="+1 (415) 555-0198&#10;..."></textarea>
+            <button id="fraud-run-button" class="btn btn-primary">🕸 Detect fraud network</button>
+          </div>
+          <div id="fraud-status" class="status" role="status"></div>
+          <div id="fraud-summary" style="margin-top:16px;"></div>
+          <div id="fraud-graph" style="margin-top:12px;"></div>
+          <div id="fraud-clusters" style="margin-top:12px; display:grid; gap:10px;"></div>
+        </div>
+        <div id="view-pricing" class="view">
+          <div class="eyebrow">Plans</div>
+          <h2>Pick your firepower.</h2>
+          <p>Upgrade with Stripe. Your tier unlocks instantly when payment completes.</p>
+          <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:20px;">
+            <div class="data-card">
+              <div class="eyebrow">Free</div>
+              <h2 style="margin:8px 0;">$0</h2>
+              <p class="hint">Single lookups<br>Local ledger cache<br>Pattern search</p>
+              <div style="margin-top:12px;"><span class="badge badge-blue">Current</span></div>
+            </div>
+            <div class="data-card" style="border-color:rgba(93,184,255,.4);">
+              <div class="eyebrow">Pro</div>
+              <h2 style="margin:8px 0;">$19<span style="font-size:13px; color:var(--muted);">/mo</span></h2>
+              <p class="hint">Everything in Free<br>Saved watchlist &amp; history<br>Bulk lookup (50/batch)<br>CSV + PDF exports</p>
+              <button id="checkout-pro-button" class="btn btn-primary" style="margin-top:12px; width:100%;">Upgrade to Pro</button>
+            </div>
+            <div class="data-card" style="border-color:rgba(108,227,218,.4);">
+              <div class="eyebrow">Pro+</div>
+              <h2 style="margin:8px 0;">$49<span style="font-size:13px; color:var(--muted);">/mo</span></h2>
+              <p class="hint">Everything in Pro<br>Bulk lookup (200/batch)<br>🕸 Fraud network detection<br>🔑 API access</p>
+              <button id="checkout-proplus-button" class="btn btn-primary" style="margin-top:12px; width:100%;">Upgrade to Pro+</button>
+            </div>
+          </div>
+          <div id="pricing-status" class="status" role="status" style="margin-top:14px;"></div>
+          <p class="hint" style="margin-top:10px;">After checkout, sign in on the <strong>Pro</strong> tab with the same email you paid with.</p>
         </div>
         <div id="view-admin" class="view">
           <div class="eyebrow">Local administration</div>
@@ -1150,7 +1869,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <script>
     const API_BASE = window.location.pathname.startsWith("/api") ? "/api" : "";
-    const state = { proEmail: null, lastRecord: null };
+    const state = { proEmail: null, proTier: null, lastRecord: null };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;" })[c]);
     const jsonLabel = (value) => esc(JSON.stringify(value, null, 2));
@@ -1252,14 +1971,25 @@ INDEX_HTML = r"""<!doctype html>
         const data = await request("/pro/login", { method: "POST", body: JSON.stringify({ email: $("pro-email").value.trim(), password: $("pro-password").value }) });
         if (!data.pro) throw new Error("This account does not have Pro access.");
         state.proEmail = data.email;
-        $("session-pro-user").textContent = data.email;
+        state.proTier = data.tier || "pro";
+        $("session-pro-user").textContent = data.email + " (" + state.proTier + ")";
+        $("tier-badge").textContent = state.proTier === "pro_plus" ? "PRO+" : "PRO";
         $("pro-login-form").style.display = "none";
         setStatus("pro-status", "Pro workspace unlocked.");
         await refreshDashboard();
+        if (state.proTier === "pro_plus") {
+          $("apikey-section").style.display = "block";
+          await refreshApiKeys();
+        } else {
+          $("apikey-section").style.display = "none";
+        }
       } catch (error) { setStatus("pro-status", error.message, true); }
     });
     $("pro-signout-button").addEventListener("click", () => {
       state.proEmail = null;
+      state.proTier = null;
+      $("apikey-section").style.display = "none";
+      $("apikey-new").textContent = "";
       $("session-pro-user").textContent = "Not signed in";
       $("pro-login-form").style.display = "grid";
       $("pro-content").style.display = "none";
@@ -1351,6 +2081,137 @@ INDEX_HTML = r"""<!doctype html>
         $("admin-output").innerHTML = refreshed.numbers.length ? refreshed.numbers.map((item) => "<div class='db-row'><span>" + esc(item.number) + "</span><span>" + item.lookup_count + " scans</span></div>").join("") : "<div class='empty'>No lookup records yet.</div>";
       } catch (error) { setStatus("admin-status", error.message, true); }
     });
+    // ---------- Premium: exports ----------
+    $("export-csv-button").addEventListener("click", () => {
+      if (!state.proEmail) return setStatus("pro-status", "Sign in first.", true);
+      window.location.href = API_BASE + "/pro/export/csv?email=" + encodeURIComponent(state.proEmail);
+    });
+    $("export-pdf-button").addEventListener("click", () => {
+      if (!state.proEmail) return setStatus("pro-status", "Sign in first.", true);
+      window.location.href = API_BASE + "/pro/export/pdf?email=" + encodeURIComponent(state.proEmail);
+    });
+
+    // ---------- Premium: tier badge + API keys ----------
+    async function refreshApiKeys() {
+      try {
+        const data = await request("/proplus/api_keys?email=" + encodeURIComponent(state.proEmail));
+        $("apikey-list").innerHTML = data.keys.length ? data.keys.map((k) =>
+          "<div class='pattern-option'><div><strong style='font-family:monospace;'>" + esc(k.key_prefix) + "</strong>" +
+          "<div class='hint'>" + esc(k.name) + " · created " + esc(k.created_at) +
+          (k.last_used ? " · last used " + esc(k.last_used) : " · never used") + "</div></div>" +
+          "<button class='btn btn-muted' data-keyid='" + k.id + "'>Revoke</button></div>"
+        ).join("") : "<span class='empty'>No API keys yet.</span>";
+        $("apikey-list").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
+          if (!confirm("Revoke this API key?")) return;
+          await request("/proplus/api_keys/" + btn.dataset.keyid + "?email=" + encodeURIComponent(state.proEmail), { method: "DELETE" });
+          setStatus("pro-status", "API key revoked.");
+          await refreshApiKeys();
+        }));
+      } catch (error) { $("apikey-list").innerHTML = "<span class='empty'>" + esc(error.message) + "</span>"; }
+    }
+    $("apikey-create-button").addEventListener("click", async () => {
+      try {
+        const data = await request("/proplus/api_keys", { method: "POST", body: JSON.stringify({ email: state.proEmail, name: $("apikey-name").value.trim() }) });
+        $("apikey-new").textContent = "New key (copy now — shown once): " + data.key;
+        $("apikey-name").value = "";
+        await refreshApiKeys();
+      } catch (error) { setStatus("pro-status", error.message, true); }
+    });
+
+    // ---------- Premium: bulk lookup ----------
+    $("bulk-run-button").addEventListener("click", async () => {
+      if (!state.proEmail) return setStatus("bulk-status", "Sign in to Pro first (Pro tab).", true);
+      const numbers = $("bulk-numbers").value.trim();
+      if (!numbers) return setStatus("bulk-status", "Paste at least one number.", true);
+      setStatus("bulk-status", "Running bulk scan...");
+      try {
+        const data = await request("/pro/bulk_lookup", { method: "POST", body: JSON.stringify({ email: state.proEmail, numbers }) });
+        setStatus("bulk-status", "Scanned " + data.processed + " of " + data.submitted + " numbers" + (data.truncated ? " (batch limit " + data.limit + ")" : "") + ".");
+        $("bulk-results").innerHTML = data.results.length ?
+          "<table style='width:100%; border-collapse:collapse; font-size:12px;'><thead><tr style='color:var(--muted); text-align:left;'>" +
+          "<th style='padding:8px; border-bottom:1px solid var(--line);'>Number</th><th style='padding:8px; border-bottom:1px solid var(--line);'>Carrier</th>" +
+          "<th style='padding:8px; border-bottom:1px solid var(--line);'>Line</th><th style='padding:8px; border-bottom:1px solid var(--line);'>Region</th>" +
+          "<th style='padding:8px; border-bottom:1px solid var(--line);'>Risk</th><th style='padding:8px; border-bottom:1px solid var(--line);'>Status</th></tr></thead><tbody>" +
+          data.results.map((r) => "<tr><td style='padding:8px; border-bottom:1px solid var(--line); font-family:monospace;'>" + esc(r.number) + "</td>" +
+            "<td style='padding:8px; border-bottom:1px solid var(--line);'>" + esc(r.carrier || "—") + "</td>" +
+            "<td style='padding:8px; border-bottom:1px solid var(--line);'>" + esc(r.line_type || "—") + "</td>" +
+            "<td style='padding:8px; border-bottom:1px solid var(--line);'>" + esc([r.city, r.state].filter(Boolean).join(", ") || r.region || "—") + "</td>" +
+            "<td style='padding:8px; border-bottom:1px solid var(--line);'>" + esc((r.spam_score ?? "—") + " · " + (r.spam_label || "")) + "</td>" +
+            "<td style='padding:8px; border-bottom:1px solid var(--line);'>" + esc(r.line_status || "—") + "</td></tr>").join("") +
+          "</tbody></table>" +
+          (data.errors.length ? "<p class='hint' style='margin-top:8px;'>" + data.errors.length + " lookups failed.</p>" : "")
+          : "<span class='empty'>No results.</span>";
+      } catch (error) { setStatus("bulk-status", error.message, true); }
+    });
+
+    // ---------- Premium: fraud network ----------
+    function renderFraudGraph(nodes, links) {
+      if (!nodes.length) { $("fraud-graph").innerHTML = ""; return; }
+      const W = 640, H = 380, cx = W / 2, cy = H / 2, R = Math.min(W, H) / 2 - 50;
+      const pos = {};
+      nodes.forEach((node, i) => {
+        const angle = (2 * Math.PI * i) / nodes.length - Math.PI / 2;
+        pos[node.number] = { x: cx + R * Math.cos(angle), y: cy + R * Math.sin(angle) };
+      });
+      const riskColor = (risk) => risk === "High risk" ? "#ff7d96" : risk === "Suspicious" ? "#ffb86b" : "#6ce3da";
+      let svg = "<svg viewBox='0 0 " + W + " " + H + "' style='width:100%; max-width:640px; border:1px solid var(--line); border-radius:14px; background:rgba(10,17,30,.6);'>";
+      links.forEach((l) => {
+        const a = pos[l.from], b = pos[l.to];
+        if (!a || !b) return;
+        svg += "<line x1='" + a.x.toFixed(1) + "' y1='" + a.y.toFixed(1) + "' x2='" + b.x.toFixed(1) + "' y2='" + b.y.toFixed(1) +
+          "' stroke='rgba(255,125,150,.45)' stroke-width='1.5'><title>" + esc(l.reason) + "</title></line>";
+      });
+      nodes.forEach((node) => {
+        const p = pos[node.number];
+        svg += "<circle cx='" + p.x.toFixed(1) + "' cy='" + p.y.toFixed(1) + "' r='16' fill='" + riskColor(node.risk) + "' fill-opacity='.85'>" +
+          "<title>" + esc(node.number + " · " + node.carrier + " · " + node.risk) + "</title></circle>" +
+          "<text x='" + p.x.toFixed(1) + "' y='" + (p.y + 30).toFixed(1) + "' text-anchor='middle' fill='#8ea0b8' font-size='9' font-family='monospace'>" +
+          esc(node.number.slice(-4)) + "</text>";
+      });
+      svg += "</svg>";
+      $("fraud-graph").innerHTML = svg;
+    }
+    $("fraud-run-button").addEventListener("click", async () => {
+      if (!state.proEmail) return setStatus("fraud-status", "Sign in to Pro+ first (Pro tab).", true);
+      const numbers = $("fraud-numbers").value.trim();
+      if (!numbers) return setStatus("fraud-status", "Paste at least one suspect number.", true);
+      setStatus("fraud-status", "Analyzing network links...");
+      try {
+        const data = await request("/proplus/fraud_network", { method: "POST", body: JSON.stringify({ email: state.proEmail, numbers }) });
+        setStatus("fraud-status", "Analyzed " + data.analyzed + " numbers · " + data.cluster_count + " linked cluster" + (data.cluster_count === 1 ? "" : "s") + " · " + data.linked_numbers + " numbers linked.");
+        $("fraud-summary").innerHTML =
+          "<div class='ingestion-summary'>" +
+          "<div class='ingestion-card'><strong>" + data.analyzed + "</strong><span>numbers analyzed</span></div>" +
+          "<div class='ingestion-card'><strong>" + data.cluster_count + "</strong><span>fraud clusters</span></div>" +
+          "<div class='ingestion-card'><strong>" + data.linked_numbers + "</strong><span>linked numbers</span></div></div>";
+        renderFraudGraph(data.nodes, data.links);
+        $("fraud-clusters").innerHTML = data.clusters.length ? data.clusters.map((c) =>
+          "<div class='data-card' style='" + (c.threat === "HIGH" ? "border-color:rgba(255,125,150,.5);" : "") + "'>" +
+          "<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;'>" +
+          "<strong>Cluster #" + c.id + " · " + c.size + " numbers</strong>" +
+          "<span class='badge " + (c.threat === "HIGH" ? "badge-green" : "badge-blue") + "' style='" + (c.threat === "HIGH" ? "color:var(--danger); background:rgba(255,125,150,.12);" : "") + "'>" + c.threat + "</span></div>" +
+          "<div class='hint' style='margin-bottom:8px;'>Shared: " + esc(Object.entries(c.shared_traits).map(([k, v]) => k + "=" + v).join(" · ") || "multiple weak signals") + "</div>" +
+          "<div class='saved-list'>" + c.members.map((m) => "<span class='pill'>" + esc(m) + "</span>").join("") + "</div></div>"
+        ).join("") : "<span class='empty'>No linked clusters found — these numbers don't share enough signals to form an operation.</span>";
+      } catch (error) { setStatus("fraud-status", error.message, true); }
+    });
+
+    // ---------- Premium: Stripe checkout ----------
+    async function startCheckout(tier) {
+      if (!state.proEmail) {
+        setStatus("pricing-status", "Sign in on the Pro tab first, then come back here.", true);
+        document.querySelector("[data-view='pro']").click();
+        return;
+      }
+      setStatus("pricing-status", "Creating secure checkout...");
+      try {
+        const data = await request("/stripe/create-checkout", { method: "POST", body: JSON.stringify({ email: state.proEmail, tier }) });
+        window.location.href = data.url;
+      } catch (error) { setStatus("pricing-status", error.message, true); }
+    }
+    $("checkout-pro-button").addEventListener("click", () => startCheckout("pro"));
+    $("checkout-proplus-button").addEventListener("click", () => startCheckout("pro_plus"));
+
     loadAreaCodes().catch((error) => setStatus("pro-status", "Area-code catalog unavailable: " + error.message, true));
     $("copyright-year").textContent = new Date().getFullYear();
   </script>
