@@ -653,6 +653,17 @@ def lookup(number: str) -> dict[str, Any]:
     return lookup_record(number)
 
 
+@app.get("/area-codes")
+@app.get("/api/area-codes")
+def area_codes() -> dict[str, Any]:
+    return {
+        "states": [
+            {"code": code, "name": value["name"], "area_codes": value["area_codes"]}
+            for code, value in sorted(STATE_AREA_CODES.items(), key=lambda item: item[1]["name"])
+        ]
+    }
+
+
 def _safe_json(raw: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(raw or "{}")
@@ -664,7 +675,7 @@ def _safe_json(raw: Any) -> dict[str, Any]:
 @app.get("/history")
 @app.get("/api/history")
 def history() -> dict[str, Any]:
-    """Return recent lookup history, most recent first."""
+    """Return recent lookup history, most recent first. Only shows numbers actually scanned in Digitscoper. No fake records."""
     items: list[dict[str, Any]] = []
     with connection() as db:
         rows = db.execute(
@@ -692,10 +703,12 @@ def history() -> dict[str, Any]:
 
 @app.delete("/history")
 @app.delete("/api/history")
-def clear_history() -> dict[str, Any]:
-    """Clear the local lookup history ledger."""
+def clear_history(password: str = Query(..., min_length=1)) -> dict[str, Any]:
+    """Clear the local lookup history ledger (admin only)."""
+    admin_check(password)
     with connection() as db:
         result = db.execute("DELETE FROM lookups")
+        db.commit()
         return {"cleared": result.rowcount}
 
 
@@ -703,75 +716,43 @@ def clear_history() -> dict[str, Any]:
 @app.get("/api/number_finder")
 def number_finder(suffix: str = Query(...), state: str = Query("")) -> dict[str, Any]:
     """Find numbers in the local ledger ending in a 4-digit suffix,
-    grouped by state then city. Local SQLite only — no external API calls."""
+    grouped by state then city. Local SQLite only — no external API calls.
+    Only shows numbers actually scanned in Digitscoper. No fake records."""
     if not re.fullmatch(r"\d{4}", suffix or ""):
         raise HTTPException(status_code=400, detail="Suffix must be exactly 4 digits.")
     state_filter = (state or "").upper().strip()
     if state_filter and state_filter not in STATE_AREA_CODES:
         raise HTTPException(status_code=400, detail="Unknown state code.")
-
+    pattern = f"%{suffix}"
     with connection() as db:
         rows = db.execute(
-            "SELECT number, carrier, spam, region, last_seen, lookup_count "
-            "FROM lookups WHERE number LIKE ? ORDER BY last_seen DESC",
-            (f"%{suffix}",),
+            "SELECT number, carrier, region, last_seen FROM lookups WHERE number LIKE ? ORDER BY last_seen DESC LIMIT 200",
+            (pattern,),
         ).fetchall()
-
-    grouped: dict[str, dict[str, Any]] = {}
+    groups: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    total = 0
     for row in rows:
         region = _safe_json(row["region"])
-        carrier = _safe_json(row["carrier"])
-        spam = _safe_json(row["spam"])
-        st = (region.get("state") or "").upper().strip() or "??"
+        st = (region.get("state") or "").upper()
         if state_filter and st != state_filter:
             continue
-        city = (region.get("city") or "").strip() or "Unknown city"
-        entry = grouped.setdefault(st, {
-            "state": st,
-            "state_name": STATE_AREA_CODES.get(st, {}).get("name", st),
-            "cities": {},
-        })
-        entry["cities"].setdefault(city, []).append({
+        city = region.get("city") or "Unknown"
+        carrier = _safe_json(row["carrier"])
+        entry = {
             "number": row["number"],
             "carrier": carrier.get("name") or "Unknown",
-            "line_type": carrier.get("line_type") or carrier.get("type") or "",
-            "fraud_score": spam.get("score"),
-            "risk_label": spam.get("label") or "",
+            "city": city,
+            "state": st,
             "last_seen": row["last_seen"],
-            "lookup_count": row["lookup_count"],
-        })
-
-    results = []
-    for st in sorted(grouped):
-        entry = grouped[st]
-        cities = [
-            {"city": city, "count": len(nums), "numbers": nums}
-            for city, nums in sorted(entry["cities"].items())
-        ]
-        results.append({
-            "state": entry["state"],
-            "state_name": entry["state_name"],
-            "count": sum(c["count"] for c in cities),
-            "cities": cities,
-        })
-
+        }
+        groups.setdefault(st or "Unknown", {}).setdefault(city, []).append(entry)
+        total += 1
     return {
         "suffix": suffix,
         "state_filter": state_filter or None,
-        "total": sum(r["count"] for r in results),
-        "results": results,
-        "source": "Digitscoper local lookup ledger",
-    }
-
-
-@app.get("/area-codes")
-@app.get("/api/area-codes")
-def area_codes() -> dict[str, Any]:
-    return {
-        "states": [
-            {"code": code, "name": value["name"], "area_codes": value["area_codes"]}
-            for code, value in sorted(STATE_AREA_CODES.items(), key=lambda item: item[1]["name"])
-        ]
+        "total": total,
+        "groups": groups,
+        "note": "Only shows numbers actually scanned in Digitscoper. No fake records.",
     }
 
 
@@ -1645,7 +1626,7 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(7, 11, 20, .68); backdrop-filter: blur(18px);
       position: sticky; top: 0; z-index: 5;
     }
-    .brand { display: flex; align-items: center; gap: 12px; min-width: 220px; cursor: pointer; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 220px; }
     .brand-mark {
       width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px;
       background: linear-gradient(135deg, var(--blue), var(--cyan));
@@ -1703,8 +1684,6 @@ INDEX_HTML = r"""<!doctype html>
     .badge { display: inline-flex; padding: 5px 9px; border-radius: 99px; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; font-weight: 800; }
     .badge-blue { color: var(--blue); background: rgba(93,184,255,.12); }
     .badge-green { color: var(--cyan); background: rgba(108,227,218,.11); }
-    .badge-red { color: var(--danger); background: rgba(255,125,150,.12); }
-    .badge-amber { color: #f5b544; background: rgba(245,181,68,.12); }
     .data-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     .data-card { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 12px; padding: 15px; }
     .data-card.wide { grid-column: 1 / -1; }
@@ -1749,13 +1728,6 @@ INDEX_HTML = r"""<!doctype html>
     .admin-output { margin-top: 20px; max-height: 280px; overflow: auto; }
     .db-row { display: flex; justify-content: space-between; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
     .db-row span:last-child { color: var(--muted); }
-    .history-list { margin-top: 6px; border: 1px solid var(--line); border-radius: 14px; background: rgba(23, 34, 55, .48); overflow: hidden; }
-    .history-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--line); padding: 12px 14px; color: var(--text); cursor: pointer; font-family: inherit; }
-    .history-row:last-child { border-bottom: none; }
-    .history-row:hover { background: rgba(93, 184, 255, .06); }
-    .history-number { font-weight: 750; font-size: 14px; }
-    .history-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
-    .history-empty { padding: 26px 14px; text-align: center; color: var(--muted); font-size: 13px; }
     .bulk-ingestion { margin-top: 26px; border: 1px solid var(--line); border-radius: 14px; background: rgba(23, 34, 55, .48); overflow: hidden; }
     .bulk-ingestion summary { cursor: pointer; padding: 16px; color: var(--text); font-size: 13px; font-weight: 750; }
     .bulk-ingestion summary::marker { color: var(--blue); }
@@ -1770,57 +1742,28 @@ INDEX_HTML = r"""<!doctype html>
     .ingestion-list { max-height: 150px; overflow: auto; display: grid; gap: 6px; }
     .ingestion-list div { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
     footer { padding: 16px; color: #56667c; text-align: center; font-size: 10px; letter-spacing: .08em; }
-    footer a { color: var(--blue); text-decoration: none; }
-    footer a:hover { text-decoration: underline; }
     @media (max-width: 820px) {
       .topbar { align-items: flex-start; flex-wrap: wrap; }
       .top-status { margin-left: auto; }
-      .tabs {
-        min-width: 0; max-width: 100%; overflow-x: auto;
-        -webkit-overflow-scrolling: touch; scrollbar-width: none;
-      }
-      .tabs::-webkit-scrollbar { display: none; }
-      .tab { flex: 0 0 auto; white-space: nowrap; }
       .workspace { grid-template-columns: 1fr; }
       .side-panel { position: static; }
-      /* Compact admin view on mobile */
-      #view-admin .eyebrow { font-size: 9px; }
-      #view-admin h2 { font-size: 17px; margin: 6px 0 4px; }
-      #view-admin > p { font-size: 12px; line-height: 1.45; }
-      #view-admin .form-stack { gap: 8px; margin-top: 14px; }
-      #view-admin .form-stack h3 { font-size: 10px; margin-bottom: 6px; }
-      #view-admin input { padding: 9px 11px; font-size: 14px; }
-      #view-admin .btn { padding: 9px 13px; font-size: 13px; }
-      #view-admin .bulk-ingestion { margin-top: 14px; }
-      #view-admin .bulk-ingestion summary { padding: 11px 13px; font-size: 12px; }
-      #view-admin .bulk-ingestion-body { gap: 8px; padding: 0 13px 13px; }
-      #view-admin .bulk-ingestion-body textarea { min-height: 90px; padding: 9px 11px; font-size: 13px; }
-      #view-admin .admin-output { margin-top: 12px; max-height: 200px; }
-      #view-admin .db-row { padding: 7px 0; font-size: 11px; }
     }
     @media (max-width: 520px) {
-      body { overflow-x: clip; }
       .tabs { width: 100%; order: 3; }
+      .tab { flex: 1; }
       .lookup-bar { flex-direction: column; }
       .data-grid { grid-template-columns: 1fr; }
       .data-card.wide { grid-column: auto; }
       .result-head { align-items: flex-start; flex-direction: column; }
       .pattern-controls { grid-template-columns: 1fr; }
       .ingestion-summary { grid-template-columns: 1fr; }
-      /* Extra-compact admin view on phones */
-      #view-admin h2 { font-size: 15px; }
-      #view-admin .form-stack { margin-top: 10px; }
-      #view-admin input { padding: 8px 10px; }
-      #view-admin .btn { padding: 8px 11px; font-size: 12px; }
-      #view-admin .bulk-ingestion summary { padding: 9px 11px; }
-      #view-admin .bulk-ingestion-body textarea { min-height: 70px; }
     }
   </style>
 </head>
 <body>
   <div class="shell">
     <header class="topbar">
-      <div class="brand" onclick="document.querySelector(&quot;[data-view='lookup']&quot;).click()" title="Back to home">
+      <div class="brand">
         <div class="brand-mark">D</div>
         <div><div class="brand-name">DIGITSCOPER</div><div class="brand-sub">Desktop intelligence engine</div></div>
       </div>
@@ -1830,8 +1773,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="tab" data-view="bulk">Bulk Lookup</button>
         <button class="tab" data-view="fraud">Fraud Network</button>
         <button class="tab" data-view="pricing">Pricing</button>
-        <button class="tab" data-view="history">History</button>
-        <button class="tab" data-view="finder">Finder</button>
+        <button class="tab" data-view="admin">Admin</button>
       </nav>
       <div class="top-status"><span class="dot"></span> Local engine online</div>
     </header>
@@ -1841,7 +1783,6 @@ INDEX_HTML = r"""<!doctype html>
           <div class="eyebrow">Unified phone lookup</div>
           <h1>See the signal<br>behind the number.</h1>
            <p class="intro">Run a live IPQualityScore scan across carrier, line status, business, risk, and reputation signals. Results are cached in your private SQLite engine for the next pass.</p>
-           <p class="hint" style="margin: 2px 0 0;">Only shows numbers actually scanned in Digitscoper. No fake records.</p>
           <div class="lookup-bar">
             <input id="lookup-number" type="text" inputmode="tel" placeholder="+1 (415) 555-0198" aria-label="Phone number">
             <button id="lookup-button" class="btn btn-primary">Run scan</button>
@@ -1974,31 +1915,6 @@ INDEX_HTML = r"""<!doctype html>
           <div id="pricing-status" class="status" role="status" style="margin-top:14px;"></div>
           <p class="hint" style="margin-top:10px;">After checkout, sign in on the <strong>Pro</strong> tab with the same email you paid with.</p>
         </div>
-        <div id="view-history" class="view">
-          <div class="eyebrow">Lookup history</div>
-          <h2>Your past scans.</h2>
-          <p class="intro">Every scan is cached in your private SQLite engine. Tap a row to re-run it.</p>
-          <div id="history-status" class="status" role="status"></div>
-          <div id="history-list" class="history-list"></div>
-          <div style="margin-top:14px;">
-            <button id="history-clear-button" class="btn btn-muted">Clear history</button>
-          </div>
-        </div>
-        <div id="view-finder" class="view">
-          <div class="eyebrow">Number finder</div>
-          <h2>Track down a partial number.</h2>
-          <p class="hint" style="margin: 2px 0 0;">Only shows numbers actually scanned in Digitscoper. No fake records.</p>
-          <p class="intro">Enter the last 4 digits of a mystery number. Digitscoper searches numbers already saved in your local engine and shows where they cluster by state and city. No external lookups — crowd-sourced from your scans. Tap a number to run a full scan on it.</p>
-          <div class="form-stack">
-            <label for="finder-suffix">Last 4 digits</label>
-            <input id="finder-suffix" inputmode="numeric" maxlength="4" placeholder="5016">
-            <label for="finder-state">State (optional)</label>
-            <select id="finder-state"><option value="">All states</option></select>
-            <button id="finder-search-button" class="btn btn-primary">Search local database</button>
-          </div>
-          <div id="finder-status" class="status" role="status"></div>
-          <div id="finder-results"></div>
-        </div>
         <div id="view-admin" class="view">
           <div class="eyebrow">Local administration</div>
           <h2>Inspect the engine ledger.</h2>
@@ -2041,7 +1957,7 @@ INDEX_HTML = r"""<!doctype html>
          <div class="hint"><strong>Privacy by design.</strong><br>Live lookup responses are requested only when you scan a number, then stored in the local SQLite database created beside the app.</div>
       </aside>
     </main>
-    <footer>Digitscoper Desktop Engine <span id="copyright-year"></span> · Secure local utility · Need help? <a href="mailto:landlordai.team@gmail.com">Contact support</a></footer>
+    <footer>Digitscoper Desktop Engine <span id="copyright-year"></span> · Secure local utility</footer>
   </div>
   <script>
     const API_BASE = window.location.pathname.startsWith("/api") ? "/api" : "";
@@ -2079,66 +1995,11 @@ INDEX_HTML = r"""<!doctype html>
       updateAreaCodeOptions();
     }
     $("pattern-state").addEventListener("change", updateAreaCodeOptions);
-    function showView(name) {
+    document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
       document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
-      const tab = document.querySelector(".tab[data-view='" + name + "']");
-      if (tab) tab.classList.add("active");
-      const view = $("view-" + name);
-      if (view) view.classList.add("active");
-    }
-    document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => {
-      if (location.hash) history.replaceState(null, "", location.pathname);
-      showView(tab.dataset.view);
-      if (tab.dataset.view === "history") loadHistory();
+      tab.classList.add("active"); $("view-" + tab.dataset.view).classList.add("active");
     }));
-    // Hidden admin access: digitscoper.onrender.com/#admin
-    function openFromHash() { if (location.hash === "#admin") showView("admin"); }
-    window.addEventListener("hashchange", openFromHash);
-    openFromHash();
-    // ---------- History ----------
-    function riskBadge(score, label) {
-      const cls = score >= 75 ? "badge badge-red" : score >= 40 ? "badge badge-amber" : "badge badge-green";
-      return "<span class='" + cls + "'>" + esc(label || (score + "/100")) + "</span>";
-    }
-    async function loadHistory() {
-      const list = $("history-list");
-      setStatus("history-status", "Loading history...");
-      try {
-        const data = await request("/history");
-        const items = data.items || [];
-        setStatus("history-status", items.length ? items.length + (items.length === 1 ? " scan" : " scans") + " on record." : "");
-        list.innerHTML = items.length ? items.map((item) => {
-          const place = [item.city, item.state].filter(Boolean).join(", ");
-          const meta = [item.carrier, item.line_type, place].filter(Boolean).join(" · ");
-          const when = item.last_seen ? new Date(item.last_seen).toLocaleString() : "";
-          const scans = item.lookup_count > 1 ? " · " + item.lookup_count + " scans" : "";
-          return "<button class='history-row' data-number='" + esc(item.number) + "'>" +
-            "<span><span class='history-number'>" + esc(item.number) + "</span>" +
-            "<span class='history-meta'>" + esc(meta) + (when ? "<br>" + esc(when) + esc(scans) : "") + "</span></span>" +
-            riskBadge(item.fraud_score ?? 0, item.risk_label) +
-            "</button>";
-        }).join("") : "<div class='history-empty'>No lookups yet.<br>Scan a number to get started.</div>";
-      } catch (error) {
-        setStatus("history-status", error.message, true);
-        list.innerHTML = "";
-      }
-    }
-    $("history-list").addEventListener("click", (event) => {
-      const row = event.target.closest(".history-row");
-      if (!row) return;
-      $("lookup-number").value = row.dataset.number;
-      document.querySelector("[data-view='lookup']").click();
-      runLookup();
-    });
-    $("history-clear-button").addEventListener("click", async () => {
-      if (!confirm("Clear all lookup history? This cannot be undone.")) return;
-      try {
-        const data = await request("/history", { method: "DELETE" });
-        setStatus("history-status", "Cleared " + data.cleared + " record" + (data.cleared === 1 ? "" : "s") + ".");
-        loadHistory();
-      } catch (error) { setStatus("history-status", error.message, true); }
-    });
     async function runLookup() {
       const number = $("lookup-number").value.trim();
       if (!number) return setStatus("lookup-status", "Enter a number to scan.", true);
