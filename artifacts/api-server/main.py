@@ -699,6 +699,71 @@ def clear_history() -> dict[str, Any]:
         return {"cleared": result.rowcount}
 
 
+@app.get("/number_finder")
+@app.get("/api/number_finder")
+def number_finder(suffix: str = Query(...), state: str = Query("")) -> dict[str, Any]:
+    """Find numbers in the local ledger ending in a 4-digit suffix,
+    grouped by state then city. Local SQLite only — no external API calls."""
+    if not re.fullmatch(r"\d{4}", suffix or ""):
+        raise HTTPException(status_code=400, detail="Suffix must be exactly 4 digits.")
+    state_filter = (state or "").upper().strip()
+    if state_filter and state_filter not in STATE_AREA_CODES:
+        raise HTTPException(status_code=400, detail="Unknown state code.")
+
+    with connection() as db:
+        rows = db.execute(
+            "SELECT number, carrier, spam, region, last_seen, lookup_count "
+            "FROM lookups WHERE number LIKE ? ORDER BY last_seen DESC",
+            (f"%{suffix}",),
+        ).fetchall()
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        region = _safe_json(row["region"])
+        carrier = _safe_json(row["carrier"])
+        spam = _safe_json(row["spam"])
+        st = (region.get("state") or "").upper().strip() or "??"
+        if state_filter and st != state_filter:
+            continue
+        city = (region.get("city") or "").strip() or "Unknown city"
+        entry = grouped.setdefault(st, {
+            "state": st,
+            "state_name": STATE_AREA_CODES.get(st, {}).get("name", st),
+            "cities": {},
+        })
+        entry["cities"].setdefault(city, []).append({
+            "number": row["number"],
+            "carrier": carrier.get("name") or "Unknown",
+            "line_type": carrier.get("line_type") or carrier.get("type") or "",
+            "fraud_score": spam.get("score"),
+            "risk_label": spam.get("label") or "",
+            "last_seen": row["last_seen"],
+            "lookup_count": row["lookup_count"],
+        })
+
+    results = []
+    for st in sorted(grouped):
+        entry = grouped[st]
+        cities = [
+            {"city": city, "count": len(nums), "numbers": nums}
+            for city, nums in sorted(entry["cities"].items())
+        ]
+        results.append({
+            "state": entry["state"],
+            "state_name": entry["state_name"],
+            "count": sum(c["count"] for c in cities),
+            "cities": cities,
+        })
+
+    return {
+        "suffix": suffix,
+        "state_filter": state_filter or None,
+        "total": sum(r["count"] for r in results),
+        "results": results,
+        "source": "Digitscoper local lookup ledger",
+    }
+
+
 @app.get("/area-codes")
 @app.get("/api/area-codes")
 def area_codes() -> dict[str, Any]:
@@ -1766,6 +1831,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="tab" data-view="fraud">Fraud Network</button>
         <button class="tab" data-view="pricing">Pricing</button>
         <button class="tab" data-view="history">History</button>
+        <button class="tab" data-view="finder">Finder</button>
       </nav>
       <div class="top-status"><span class="dot"></span> Local engine online</div>
     </header>
@@ -1916,6 +1982,21 @@ INDEX_HTML = r"""<!doctype html>
           <div style="margin-top:14px;">
             <button id="history-clear-button" class="btn btn-muted">Clear history</button>
           </div>
+        </div>
+        <div id="view-finder" class="view">
+          <div class="eyebrow">Number finder</div>
+          <h2>Track down a partial number.</h2>
+          <p class="hint" style="margin: 2px 0 0;">Only shows numbers actually scanned in Digitscoper. No fake records.</p>
+          <p class="intro">Enter the last 4 digits of a mystery number. Digitscoper searches numbers already saved in your local engine and shows where they cluster by state and city. No external lookups — crowd-sourced from your scans. Tap a number to run a full scan on it.</p>
+          <div class="form-stack">
+            <label for="finder-suffix">Last 4 digits</label>
+            <input id="finder-suffix" inputmode="numeric" maxlength="4" placeholder="5016">
+            <label for="finder-state">State (optional)</label>
+            <select id="finder-state"><option value="">All states</option></select>
+            <button id="finder-search-button" class="btn btn-primary">Search local database</button>
+          </div>
+          <div id="finder-status" class="status" role="status"></div>
+          <div id="finder-results"></div>
         </div>
         <div id="view-admin" class="view">
           <div class="eyebrow">Local administration</div>
