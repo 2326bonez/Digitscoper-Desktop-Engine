@@ -1650,6 +1650,8 @@ INDEX_HTML = r"""<!doctype html>
     .ingestion-list { max-height: 150px; overflow: auto; display: grid; gap: 6px; }
     .ingestion-list div { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
     footer { padding: 16px; color: #56667c; text-align: center; font-size: 10px; letter-spacing: .08em; }
+    footer a { color: var(--blue); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
     @media (max-width: 820px) {
       .topbar { align-items: flex-start; flex-wrap: wrap; }
       .top-status { margin-left: auto; }
@@ -1865,7 +1867,7 @@ INDEX_HTML = r"""<!doctype html>
          <div class="hint"><strong>Privacy by design.</strong><br>Live lookup responses are requested only when you scan a number, then stored in the local SQLite database created beside the app.</div>
       </aside>
     </main>
-    <footer>Digitscoper Desktop Engine <span id="copyright-year"></span> · Secure local utility</footer>
+    <footer>Digitscoper Desktop Engine <span id="copyright-year"></span> · Secure local utility · Need help? <a href="mailto:landlordai.team@gmail.com">Contact support</a></footer>
   </div>
   <script>
     const API_BASE = window.location.pathname.startsWith("/api") ? "/api" : "";
