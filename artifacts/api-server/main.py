@@ -31,6 +31,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 import urllib.error
@@ -59,7 +60,7 @@ except ImportError:
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 
@@ -81,6 +82,9 @@ TIER_FREE = "free"
 TIER_PRO = "pro"
 TIER_PROPLUS = "pro_plus"
 VALID_TIERS = (TIER_FREE, TIER_PRO, TIER_PROPLUS)
+
+# Conservative email shape check used before any Stripe call.
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 STATE_AREA_CODES: dict[str, dict[str, Any]] = {
     "AL": {"name": "Alabama", "area_codes": ["205", "251", "256", "334", "938"]},
@@ -406,6 +410,17 @@ class BulkIngestionRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     tier: str = Field(min_length=2, max_length=16)  # "pro" | "pro_plus"
+
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, value: str) -> str:
+        # Reject malformed emails before any Stripe call is made. New
+        # customers check out with just an email (no account required), so
+        # the address must be well-formed for fulfillment to reach them.
+        value = value.strip().lower()
+        if not EMAIL_RE.match(value):
+            raise ValueError("Enter a valid email address.")
+        return value
 
 
 class BulkLookupRequest(BaseModel):
@@ -1324,6 +1339,10 @@ def stripe_create_checkout(req: CheckoutRequest) -> dict[str, Any]:
             customer_email=email,
             line_items=[{"price": price_id, "quantity": 1}],
             metadata={"email": email, "tier": tier},
+            # Copy identity onto the subscription itself so later subscription
+            # lifecycle events (e.g. customer.subscription.deleted) can be
+            # fulfilled without depending on a Customer.retrieve API call.
+            subscription_data={"metadata": {"email": email, "tier": tier}},
             success_url=os.environ.get("STRIPE_SUCCESS_URL", base_url + "/")
             + "?checkout=success&session_id={CHECKOUT_SESSION_ID}",
             cancel_url=os.environ.get("STRIPE_CANCEL_URL", base_url + "/") + "?checkout=cancelled",
@@ -1397,19 +1416,38 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         return {"status": "fulfilled", "email": email, "tier": tier}
 
     if event_type == "customer.subscription.deleted":
-        # downgrade: find by customer email when available
-        customer_id = data_object.get("customer")
-        email = ""
-        try:
-            if customer_id:
-                customer = stripe.Customer.retrieve(customer_id)  # type: ignore[union-attr]
-                email = (_stripe_object_dict(customer).get("email") or "").strip().lower()
-        except Exception:
-            email = ""
+        # Downgrade: the subscription carries our email in its metadata
+        # (set at checkout creation), so no extra API call is needed in the
+        # common case. Customer.retrieve is only a fallback, and its
+        # failures are logged — never silently swallowed.
         metadata = _stripe_object_dict(data_object.get("metadata", {}))
-        email = email or (metadata.get("email") or "").strip().lower()
+        email = (metadata.get("email") or "").strip().lower()
+        if not email:
+            customer_ref = data_object.get("customer")
+            customer_id = (
+                _stripe_object_dict(customer_ref).get("id")
+                if isinstance(customer_ref, dict)
+                else customer_ref
+            )
+            if customer_id:
+                try:
+                    customer = stripe.Customer.retrieve(customer_id)  # type: ignore[union-attr]
+                    email = (_stripe_object_dict(customer).get("email") or "").strip().lower()
+                except Exception as error:
+                    print(
+                        f"[stripe] customer.subscription.deleted: "
+                        f"Customer.retrieve failed for {customer_id}: {error}",
+                        file=sys.stderr,
+                    )
+                    email = ""
         if email:
             set_user_tier(email, TIER_FREE)
+        else:
+            print(
+                "[stripe] customer.subscription.deleted: could not determine "
+                "customer email; downgrade skipped",
+                file=sys.stderr,
+            )
         return {"status": "downgraded", "email": email}
 
     return {"status": "ignored", "type": event_type}
@@ -2169,6 +2207,12 @@ INDEX_HTML = r"""<!doctype html>
           <div class="eyebrow">Plans</div>
           <h2>Pick your firepower.</h2>
           <p>Upgrade with Stripe. Your tier unlocks instantly when payment completes.</p>
+          <div id="checkout-email-row" style="margin-top:16px; max-width:420px;">
+            <label for="checkout-email" class="hint" style="display:block; margin-bottom:6px;">Email for your Pro account</label>
+            <input id="checkout-email" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com"
+              style="width:100%; color:var(--text); background:#0a111e; border:1px solid var(--line); border-radius:10px; padding:12px 14px; font:inherit;" />
+            <p class="hint" id="checkout-email-hint" style="margin-top:6px;">New here? No signup needed — enter your email, pay, then set a password on the Pro tab.</p>
+          </div>
           <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:20px;">
             <div class="data-card">
               <div class="eyebrow">Free</div>
@@ -2190,7 +2234,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
           <div id="pricing-status" class="status" role="status" style="margin-top:14px;"></div>
-          <p class="hint" style="margin-top:10px;">After checkout, sign in on the <strong>Pro</strong> tab with the same email you paid with.</p>
+          <p class="hint" style="margin-top:10px;">After checkout you'll land back here to set a password and unlock your Pro workspace. Signed in already? Checkout uses your account email.</p>
         </div>
         <div id="view-admin" class="view">
           <div class="eyebrow">Local administration</div>
@@ -2324,6 +2368,25 @@ INDEX_HTML = r"""<!doctype html>
       } else {
         btn.textContent = "Sign in";
         btn.title = "Sign in to Pro";
+      }
+      syncCheckoutEmail();
+    }
+    // Keep the pricing-tab email row in sync with sign-in state: signed-in
+    // users check out with their account email; guests enter one.
+    function syncCheckoutEmail() {
+      const row = $("checkout-email-row");
+      const input = $("checkout-email");
+      const hint = $("checkout-email-hint");
+      if (!row || !input) return;
+      if (state.proEmail) {
+        input.value = state.proEmail;
+        input.readOnly = true;
+        input.style.opacity = "0.7";
+        if (hint) hint.textContent = "Checking out as " + state.proEmail + " (your signed-in account).";
+      } else {
+        input.readOnly = false;
+        input.style.opacity = "1";
+        if (hint) hint.textContent = "New here? No signup needed — enter your email, pay, then set a password on the Pro tab.";
       }
     }
     $("topbar-auth-button").addEventListener("click", () => {
@@ -2676,15 +2739,23 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     // ---------- Premium: Stripe checkout ----------
+    // Signed-in users check out with their account email. New customers
+    // check out with just an email address — the account is created by the
+    // Stripe webhook and they set a password on return (?checkout=success).
     async function startCheckout(tier) {
-      if (!state.proEmail) {
-        setStatus("pricing-status", "Sign in on the Pro tab first, then come back here.", true);
-        document.querySelector("[data-view='pro']").click();
-        return;
+      let email = state.proEmail;
+      if (!email) {
+        const input = $("checkout-email");
+        email = (input ? input.value : "").trim().toLowerCase();
+        if (!/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(email)) {
+          setStatus("pricing-status", "Enter a valid email address to start checkout.", true);
+          if (input) input.focus();
+          return;
+        }
       }
       setStatus("pricing-status", "Creating secure checkout...");
       try {
-        const data = await request("/stripe/create-checkout", { method: "POST", body: JSON.stringify({ email: state.proEmail, tier }) });
+        const data = await request("/stripe/create-checkout", { method: "POST", body: JSON.stringify({ email, tier }) });
         window.location.href = data.url;
       } catch (error) { setStatus("pricing-status", error.message, true); }
     }
@@ -2692,8 +2763,9 @@ INDEX_HTML = r"""<!doctype html>
     $("checkout-proplus-button").addEventListener("click", () => startCheckout("pro_plus"));
 
     // After a successful Stripe checkout the customer lands back with
-    // ?checkout=success&session_id=... — they set their password here
-    // (verified against the paid Stripe session) and are signed straight in.
+    // ?checkout=success&session_id=... — new customers set their password
+    // here (verified against the paid Stripe session) and are signed
+    // straight in. Signed-in customers upgrading keep their credentials.
     (function handleCheckoutReturn() {
       const params = new URLSearchParams(window.location.search);
       if (params.get("checkout") === "cancelled") {
@@ -2702,6 +2774,13 @@ INDEX_HTML = r"""<!doctype html>
       const sessionId = params.get("session_id");
       if (params.get("checkout") !== "success" || !sessionId) return;
       goToView("pro");
+      // Clean the session_id out of the address bar for both branches.
+      const cleanUrl = () => window.history.replaceState(null, "", window.location.pathname);
+      if (state.proEmail) {
+        setStatus("pro-status", "Payment received! Your tier is upgrading — refresh the Pro workspace in a moment.");
+        cleanUrl();
+        return;
+      }
       $("pro-login-form").style.display = "none";
       $("pro-setup-form").style.display = "grid";
       setStatus("pro-status", "Payment received! Set a password to unlock your Pro workspace.");
