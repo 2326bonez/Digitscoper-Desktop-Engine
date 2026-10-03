@@ -1091,28 +1091,46 @@ def stripe_create_checkout(req: CheckoutRequest) -> dict[str, Any]:
     return {"url": session.url, "session_id": session.id}
 
 
+def _stripe_object_dict(value: Any) -> dict[str, Any]:
+    """Convert Stripe SDK resources to ordinary mappings before using dict APIs."""
+    if isinstance(value, dict):
+        return value
+    converter = getattr(value, "to_dict_recursive", None)
+    if callable(converter):
+        converted = converter()
+    else:
+        converter = getattr(value, "to_dict", None)
+        converted = converter() if callable(converter) else {}
+    return converted if isinstance(converted, dict) else {}
+
+
 @app.post("/stripe/webhook")
 @app.post("/api/stripe/webhook")
 async def stripe_webhook(request: Request) -> dict[str, Any]:
     """Verify the Stripe signature and fulfill subscription events."""
     if not _stripe_ready():
         raise HTTPException(status_code=503, detail="Stripe is not configured.")
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Stripe webhook secret is not configured.")
     payload = await request.body()
     signature = request.headers.get("stripe-signature", "")
     try:
-        if STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)  # type: ignore[union-attr]
-        else:
-            event = stripe.Event.construct_from(json.loads(payload), STRIPE_SECRET_KEY)  # type: ignore[union-attr]
+        event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)  # type: ignore[union-attr]
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Invalid webhook signature: {error}") from error
 
-    event_type = event.get("type", "")
-    data_object = event.get("data", {}).get("object", {}) or {}
+    event_payload = _stripe_object_dict(event)
+    event_type = event_payload.get("type", "")
+    event_data = _stripe_object_dict(event_payload.get("data", {}))
+    data_object = _stripe_object_dict(event_data.get("object", {}))
 
-    if event_type == "checkout.session.completed":
-        email = (data_object.get("metadata", {}) or {}).get("email") or data_object.get("customer_email") or ""
-        tier = (data_object.get("metadata", {}) or {}).get("tier", "").strip().lower()
+    if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        if data_object.get("payment_status") != "paid":
+            return {"status": "pending"}
+        metadata = _stripe_object_dict(data_object.get("metadata", {}))
+        customer_details = _stripe_object_dict(data_object.get("customer_details", {}))
+        email = metadata.get("email") or data_object.get("customer_email") or customer_details.get("email") or ""
+        tier = (metadata.get("tier") or "").strip().lower()
         if tier not in (TIER_PRO, TIER_PROPLUS):
             tier = TIER_PRO
         email = email.strip().lower()
@@ -1140,10 +1158,10 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         try:
             if customer_id:
                 customer = stripe.Customer.retrieve(customer_id)  # type: ignore[union-attr]
-                email = (customer.get("email") or "").strip().lower()
+                email = (_stripe_object_dict(customer).get("email") or "").strip().lower()
         except Exception:
             email = ""
-        metadata = data_object.get("metadata", {}) or {}
+        metadata = _stripe_object_dict(data_object.get("metadata", {}))
         email = email or (metadata.get("email") or "").strip().lower()
         if email:
             set_user_tier(email, TIER_FREE)
