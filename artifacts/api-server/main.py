@@ -40,6 +40,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from collections import defaultdict
 
 import bcrypt
 import uvicorn
@@ -435,16 +436,64 @@ class ApiKeyCreateRequest(BaseModel):
     name: str = Field(default="", max_length=80)
 
 
+# --- rate limiting (SEC-01) ---
+# Simple in-memory sliding-window rate limiter for auth endpoints.
+# Protects against credential-stuffing / brute-force on login + set_password.
+_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+_RATE_LIMIT_MAX_ATTEMPTS = int(os.environ.get("RATE_LIMIT_MAX_ATTEMPTS", "10"))
+_rate_limit_hits: dict[str, list[float]] = defaultdict(list)
+_rate_limit_lock = threading.Lock()
+
+
+def _rate_limit_key(request: Request) -> str:
+    """Identify the client for rate limiting (proxy-aware)."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _check_rate_limit(request: Request, endpoint: str) -> None:
+    """Raise 429 if the client exceeded the auth rate limit."""
+    key = f"{endpoint}:{_rate_limit_key(request)}"
+    now = time.monotonic()
+    cutoff = now - _RATE_LIMIT_WINDOW_SECONDS
+    with _rate_limit_lock:
+        hits = _rate_limit_hits[key]
+        # drop expired entries
+        while hits and hits[0] < cutoff:
+            hits.pop(0)
+        if len(hits) >= _RATE_LIMIT_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many attempts. Please try again later.",
+            )
+        hits.append(now)
+
+
+# --- production hardening (SEC-02, SEC-03) ---
+# In production, disable the auto-generated API docs (they expose the full
+# route schema including admin endpoints) and restrict CORS to the app's own
+# origin instead of a wildcard.
+_PRODUCTION = os.environ.get("RENDER") == "true" or os.environ.get("ENVIRONMENT") == "production"
+_APP_ORIGIN = os.environ.get("APP_BASE_URL", "https://digitscoper.onrender.com").rstrip("/")
+
 app = FastAPI(
     title="Digitscoper Desktop Engine",
     description="Unified phone lookup, Pro saves, and local SQLite administration.",
     version="2.0.0",
+    docs_url=None if _PRODUCTION else "/docs",
+    redoc_url=None if _PRODUCTION else "/redoc",
+    openapi_url=None if _PRODUCTION else "/openapi.json",
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[_APP_ORIGIN] if _PRODUCTION else ["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Password"],
+    allow_credentials=False,
 )
 
 
@@ -460,6 +509,8 @@ async def _security_headers(request: Request, call_next):  # type: ignore[no-unt
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # SEC-04: HSTS — the app is HTTPS-only (Render + Cloudflare enforce TLS).
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
@@ -954,7 +1005,9 @@ def pattern_search(area_code: str, suffix: str) -> dict[str, Any]:
 
 @app.post("/pro/login")
 @app.post("/api/pro/login")
-def pro_login(req: ProLoginRequest) -> dict[str, Any]:
+def pro_login(req: ProLoginRequest, request: Request) -> dict[str, Any]:
+    # SEC-01: rate-limit auth attempts to blunt credential stuffing.
+    _check_rate_limit(request, "pro_login")
     with connection() as db:
         row = db.execute(
             "SELECT password, is_pro, tier FROM users WHERE lower(email) = lower(?)",
@@ -1002,7 +1055,7 @@ class ProSetPasswordRequest(BaseModel):
 
 @app.post("/pro/set_password")
 @app.post("/api/pro/set_password")
-def pro_set_password(req: ProSetPasswordRequest) -> dict[str, Any]:
+def pro_set_password(req: ProSetPasswordRequest, request: Request) -> dict[str, Any]:
     """Let a new Stripe subscriber set their password.
 
     Proof of ownership is the Stripe checkout session ID from the success
@@ -1010,6 +1063,8 @@ def pro_set_password(req: ProSetPasswordRequest) -> dict[str, Any]:
     addressed to the same email. Only accounts flagged password_setup_required
     (created by the webhook) may use this flow.
     """
+    # SEC-01: rate-limit to blunt enumeration / brute-force.
+    _check_rate_limit(request, "pro_set_password")
     if not _stripe_ready():
         raise HTTPException(status_code=503, detail="Stripe is not configured.")
     email = req.email.strip().lower()
@@ -1018,12 +1073,12 @@ def pro_set_password(req: ProSetPasswordRequest) -> dict[str, Any]:
             "SELECT password_setup_required, tier, is_pro FROM users WHERE lower(email) = lower(?)",
             (email,),
         ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Account not found.")
-    if not row["password_setup_required"]:
+    # SEC-05: return a generic error whether the account exists or not, so
+    # attackers cannot enumerate registered emails.
+    if row is None or not row["password_setup_required"]:
         raise HTTPException(
             status_code=400,
-            detail="Password is already set. Use the Pro tab to sign in.",
+            detail="Invalid request.",
         )
     try:
         checkout = stripe.checkout.Session.retrieve(req.session_id.strip())  # type: ignore[union-attr]
