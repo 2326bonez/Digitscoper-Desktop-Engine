@@ -446,7 +446,15 @@ _rate_limit_lock = threading.Lock()
 
 
 def _rate_limit_key(request: Request) -> str:
-    """Identify the client for rate limiting (proxy-aware)."""
+    """Identify the client for rate limiting (proxy-aware).
+
+    Prefers CF-Connecting-IP when behind Cloudflare (Cloudflare overwrites
+    this header, so clients cannot spoof it to rotate keys), then the first
+    entry of X-Forwarded-For, then the socket peer.
+    """
+    cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+    if cf_ip:
+        return cf_ip
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
         return forwarded.split(",")[0].strip()
