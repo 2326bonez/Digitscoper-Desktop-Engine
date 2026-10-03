@@ -223,6 +223,11 @@ def init_db() -> None:
                 expires_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email);
+            CREATE TABLE IF NOT EXISTS rate_limit_hits (
+                bucket TEXT NOT NULL,
+                ts REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_bucket_ts ON rate_limit_hits (bucket, ts);
             """
         )
         # --- tier column migration (replaces boolean is_pro) ---
@@ -436,13 +441,15 @@ class ApiKeyCreateRequest(BaseModel):
     name: str = Field(default="", max_length=80)
 
 
-# --- rate limiting (SEC-01) ---
-# Simple in-memory sliding-window rate limiter for auth endpoints.
-# Protects against credential-stuffing / brute-force on login + set_password.
+# --- rate limiting (SEC-01 / SEC-01R) ---
+# Shared sliding-window rate limiter backed by the SQLite ledger (WAL mode)
+# so the limits hold across every worker process on the instance. The
+# previous in-memory dict was per-process and was proven ineffective across
+# workers. Protects against credential-stuffing / brute-force on login +
+# set_password, and caps /api/lookup volume per client IP.
 _RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
 _RATE_LIMIT_MAX_ATTEMPTS = int(os.environ.get("RATE_LIMIT_MAX_ATTEMPTS", "10"))
-_rate_limit_hits: dict[str, list[float]] = defaultdict(list)
-_rate_limit_lock = threading.Lock()
+_rate_limit_last_prune = 0.0
 
 
 def _rate_limit_key(request: Request) -> str:
@@ -463,6 +470,25 @@ def _rate_limit_key(request: Request) -> str:
     return "unknown"
 
 
+def _prune_rate_limit_rows(older_than: float) -> None:
+    """Best-effort global prune of ancient rate-limit rows.
+
+    Per-bucket cleanup already runs inside every limit check; this just keeps
+    the table small for buckets that never return. Throttled to ~10 minutes
+    per worker process and never allowed to break the request.
+    """
+    global _rate_limit_last_prune
+    now_mono = time.monotonic()
+    if now_mono - _rate_limit_last_prune < 600:
+        return
+    _rate_limit_last_prune = now_mono
+    try:
+        with connection() as db:
+            db.execute("DELETE FROM rate_limit_hits WHERE ts < ?", (older_than,))
+    except Exception:
+        pass
+
+
 def _check_rate_limit(
     request: Request,
     endpoint: str,
@@ -471,25 +497,51 @@ def _check_rate_limit(
 ) -> None:
     """Raise 429 if the client exceeded the rate limit for the given endpoint.
 
+    Shared across all worker processes via the SQLite ledger: the
+    check-and-increment runs inside a single BEGIN IMMEDIATE transaction so
+    concurrent workers cannot both slip under the limit.
+
     max_attempts / window_seconds default to the global auth-limiter env values
     when not provided, so existing call sites keep their behavior.
     """
     limit = max_attempts if max_attempts is not None else _RATE_LIMIT_MAX_ATTEMPTS
     window = window_seconds if window_seconds is not None else _RATE_LIMIT_WINDOW_SECONDS
     key = f"{endpoint}:{_rate_limit_key(request)}"
-    now = time.monotonic()
+    now = time.time()  # wall clock: monotonic() differs per worker process
     cutoff = now - window
-    with _rate_limit_lock:
-        hits = _rate_limit_hits[key]
-        # drop expired entries
-        while hits and hits[0] < cutoff:
-            hits.pop(0)
-        if len(hits) >= limit:
+    db = connection()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "DELETE FROM rate_limit_hits WHERE bucket = ? AND ts < ?",
+            (key, cutoff),
+        )
+        count = db.execute(
+            "SELECT COUNT(*) AS c FROM rate_limit_hits WHERE bucket = ?",
+            (key,),
+        ).fetchone()["c"]
+        if count >= limit:
+            db.execute("ROLLBACK")
             raise HTTPException(
                 status_code=429,
                 detail="Too many attempts. Please try again later.",
             )
-        hits.append(now)
+        db.execute(
+            "INSERT INTO rate_limit_hits (bucket, ts) VALUES (?, ?)",
+            (key, now),
+        )
+        db.execute("COMMIT")
+    except HTTPException:
+        raise
+    except Exception:
+        try:
+            db.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        db.close()
+    _prune_rate_limit_rows(now - max(window, 3600))
 
 
 # --- production hardening (SEC-02, SEC-03) ---
@@ -1003,8 +1055,12 @@ def _safe_json(raw: Any) -> dict[str, Any]:
 
 @app.get("/history")
 @app.get("/api/history")
-def history() -> dict[str, Any]:
-    """Return recent lookup history, most recent first. Only shows numbers actually scanned in Digitscoper. No fake records."""
+def history(request: Request) -> dict[str, Any]:
+    """Return recent lookup history, most recent first. Only shows numbers actually scanned in Digitscoper. No fake records.
+
+    Admin only: the global lookup ledger is not publicly readable (privacy).
+    """
+    admin_check_request(request)
     items: list[dict[str, Any]] = []
     with connection() as db:
         rows = db.execute(
@@ -1043,10 +1099,18 @@ def clear_history(request: Request) -> dict[str, Any]:
 
 @app.get("/number_finder")
 @app.get("/api/number_finder")
-def number_finder(suffix: str = Query(...), state: str = Query("")) -> dict[str, Any]:
+def number_finder(
+    request: Request,
+    suffix: str = Query(...),
+    state: str = Query(""),
+) -> dict[str, Any]:
     """Find numbers in the local ledger ending in a 4-digit suffix,
     grouped by state then city. Local SQLite only — no external API calls.
-    Only shows numbers actually scanned in Digitscoper. No fake records."""
+    Only shows numbers actually scanned in Digitscoper. No fake records.
+
+    Admin only: the global lookup ledger is not publicly readable (privacy).
+    """
+    admin_check_request(request)
     if not re.fullmatch(r"\d{4}", suffix or ""):
         raise HTTPException(status_code=400, detail="Suffix must be exactly 4 digits.")
     state_filter = (state or "").upper().strip()
@@ -2272,6 +2336,9 @@ INDEX_HTML = r"""<!doctype html>
     .hint { color: var(--muted); font-size: 11px; line-height: 1.7; }
     .hint strong { color: #c7d7e9; font-weight: 650; }
     .admin-output { margin-top: 20px; max-height: 280px; overflow: auto; }
+    .linklike { background: none; border: none; padding: 0; color: inherit; font: inherit; text-decoration: underline; cursor: pointer; }
+    .finder-state { margin-top: 12px; }
+    .finder-city { margin: 6px 0 6px 12px; }
     .db-row { display: flex; justify-content: space-between; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
     .db-row span:last-child { color: var(--muted); }
     .bulk-ingestion { margin-top: 26px; border: 1px solid var(--line); border-radius: 14px; background: rgba(23, 34, 55, .48); overflow: hidden; }
@@ -2491,6 +2558,21 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div id="admin-status" class="status" role="status"></div>
           <div id="admin-output" class="admin-output"></div>
+          <div class="form-stack" style="margin-top:18px">
+            <h3>Scan history</h3>
+            <p class="hint">The 50 most recently scanned numbers. Tap a number to rerun the scan. Admin only.</p>
+            <button id="history-load-button" class="btn btn-muted">Load scan history</button>
+            <div id="history-output" class="admin-output"></div>
+          </div>
+          <div class="form-stack" style="margin-top:18px">
+            <h3>Number finder</h3>
+            <p class="hint">Search the local ledger for numbers ending in a 4-digit suffix, grouped by state and city. No external API calls. Only shows numbers actually scanned in Digitscoper — no fake records. Admin only.</p>
+            <label for="finder-suffix">Last 4 digits</label><input id="finder-suffix" type="text" inputmode="numeric" maxlength="4" placeholder="5016">
+            <label for="finder-state">State filter (optional)</label><input id="finder-state" type="text" maxlength="2" placeholder="CA">
+            <button id="finder-search-button" class="btn btn-muted">Search ledger</button>
+            <div id="finder-status" class="status" role="status"></div>
+            <div id="finder-output" class="admin-output"></div>
+          </div>
            <details class="bulk-ingestion">
              <summary>Bulk Target Ingestion Node</summary>
              <div class="bulk-ingestion-body">
@@ -2838,6 +2920,44 @@ INDEX_HTML = r"""<!doctype html>
         setStatus("admin-status", "Loaded " + data.total_numbers + " lookup records.");
         $("admin-output").innerHTML = data.numbers.length ? data.numbers.map((item) => "<div class='db-row'><span>" + esc(item.number) + "</span><span>" + item.lookup_count + " scans</span></div>").join("") : "<div class='empty'>No lookup records yet.</div>";
       } catch (error) { setStatus("admin-status", error.message, true); }
+    });
+    $("history-load-button").addEventListener("click", async () => {
+      try {
+        const data = await request("/history", { headers: adminHeaders() });
+        setStatus("admin-status", "Loaded " + data.items.length + " recent scans.");
+        $("history-output").innerHTML = data.items.length ? data.items.map((item) => {
+          const place = [item.city, item.state].filter(Boolean).join(", ") || "Unknown";
+          return "<div class='db-row'><button class='linklike' data-number='" + esc(item.number) + "'>" + esc(item.number) + "</button><span>" + esc(place) + " · " + item.lookup_count + " scan" + (item.lookup_count === 1 ? "" : "s") + "</span></div>";
+        }).join("") : "<div class='empty'>No scans yet.</div>";
+        $("history-output").querySelectorAll("[data-number]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            $("lookup-number").value = btn.getAttribute("data-number");
+            document.querySelector("[data-view='lookup']").click();
+            runLookup();
+          });
+        });
+      } catch (error) { setStatus("admin-status", error.message, true); }
+    });
+    $("finder-search-button").addEventListener("click", async () => {
+      const suffix = $("finder-suffix").value.trim();
+      const state = $("finder-state").value.trim().toUpperCase();
+      if (!/^\d{4}$/.test(suffix)) return setStatus("finder-status", "Enter exactly 4 digits.", true);
+      try {
+        const data = await request("/number_finder?suffix=" + encodeURIComponent(suffix) + (state ? "&state=" + encodeURIComponent(state) : ""), { headers: adminHeaders() });
+        setStatus("finder-status", "Found " + data.total + " match" + (data.total === 1 ? "" : "es") + " for suffix " + esc(data.suffix) + ".");
+        const groups = data.groups || {};
+        const states = Object.keys(groups).sort();
+        let html = states.length ? states.map((st) =>
+          "<div class='finder-state'><strong>" + esc(st) + "</strong>" +
+          Object.keys(groups[st]).sort().map((city) =>
+            "<div class='finder-city'>" + esc(city) + " (" + groups[st][city].length + ")" +
+            groups[st][city].map((entry) => "<div class='db-row'><span>" + esc(entry.number) + "</span><span>" + esc(entry.carrier || "Unknown") + "</span></div>").join("") +
+            "</div>"
+          ).join("") + "</div>"
+        ).join("") : "<div class='empty'>No matches. Only numbers actually scanned in Digitscoper appear here — no fake records.</div>";
+        html += "<div class='hint' style='margin-top:8px'>" + esc(data.note || "") + "</div>";
+        $("finder-output").innerHTML = html;
+      } catch (error) { setStatus("finder-status", error.message, true); }
     });
     $("admin-add-user-button").addEventListener("click", async () => {
       try {
