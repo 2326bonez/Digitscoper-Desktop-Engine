@@ -14,6 +14,13 @@ import {
 
 const queryClient = new QueryClient();
 
+// Base URL of the Digitscoper service loaded in the shell's iframe.
+// Defaults to the same-origin "/api/" for web deploys. For Capacitor native
+// builds, set VITE_API_BASE_URL to the live backend, e.g.
+// https://digitscoper.onrender.com/api/ (see CAPACITOR.md).
+const SERVICE_URL =
+  import.meta.env.VITE_API_BASE_URL || '/api/';
+
 function Home() {
   const [isLoading, setIsLoading] = useState(true);
   const [showFallback, setShowFallback] = useState(false);
@@ -43,7 +50,7 @@ function Home() {
             {isLoading ? 'Connecting' : 'Live'}
           </div>
           <a
-            href="/api/"
+            href={SERVICE_URL}
             target="_blank"
             rel="noreferrer"
             data-testid="link-open-dashboard"
@@ -58,7 +65,7 @@ function Home() {
       <section className="service-frame relative min-h-0 flex-1">
         <iframe
           key={frameKey}
-          src="/api/"
+          src={SERVICE_URL}
           title="Digitscoper dashboard"
           data-testid="iframe-dashboard"
           onLoad={() => setIsLoading(false)}
@@ -89,7 +96,7 @@ function Home() {
                 Retry
               </button>
               <a
-                href="/api/"
+                href={SERVICE_URL}
                 target="_blank"
                 rel="noreferrer"
                 data-testid="link-fallback-dashboard"

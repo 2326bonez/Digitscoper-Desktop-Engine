@@ -1656,10 +1656,11 @@ INDEX_HTML = r"""<!doctype html>
     }
     .brand-name { font-size: 14px; letter-spacing: .17em; font-weight: 800; }
     .brand-sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
-    .tabs { display: flex; gap: 6px; }
+    .tabs { display: flex; gap: 6px; flex-wrap: nowrap; overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
     .tab {
       color: var(--muted); background: transparent; border: 1px solid transparent;
       border-radius: 9px; padding: 9px 15px; transition: .2s ease;
+      flex-shrink: 0; white-space: nowrap;
     }
     .tab:hover { color: var(--text); background: rgba(255,255,255,.04); }
     .tab.active { color: #06111d; background: var(--blue); border-color: var(--blue); }
@@ -1772,7 +1773,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     @media (max-width: 520px) {
       .tabs { width: 100%; order: 3; }
-      .tab { flex: 1; }
+      .tab { flex: 0 0 auto; }
       .lookup-bar { flex-direction: column; }
       .data-grid { grid-template-columns: 1fr; }
       .data-card.wide { grid-column: auto; }
@@ -1798,6 +1799,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="tab" data-view="admin">Admin</button>
       </nav>
       <div class="top-status"><span class="dot"></span> Local engine online</div>
+      <button id="topbar-auth-button" class="btn btn-primary" style="padding: 8px 14px; font-size: 12px; flex-shrink: 0;" title="Sign in to Pro">Sign in</button>
     </header>
     <main class="workspace">
       <section class="panel main-panel">
@@ -2022,6 +2024,33 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
       tab.classList.add("active"); $("view-" + tab.dataset.view).classList.add("active");
     }));
+    // Topbar auth shortcut: jump straight to the Pro login form (or the Pro
+    // workspace when already signed in) so sign-in is one tap from anywhere.
+    function goToView(name) {
+      const tab = document.querySelector('.tab[data-view="' + name + '"]');
+      if (tab) tab.click();
+    }
+    function updateTopbarAuth() {
+      const btn = $("topbar-auth-button");
+      if (!btn) return;
+      if (state.proEmail) {
+        btn.textContent = "✓ Pro";
+        btn.title = "Signed in as " + state.proEmail + " — open Pro workspace";
+      } else {
+        btn.textContent = "Sign in";
+        btn.title = "Sign in to Pro";
+      }
+    }
+    $("topbar-auth-button").addEventListener("click", () => {
+      goToView("pro");
+      if (!state.proEmail) {
+        const form = $("pro-login-form");
+        if (form) form.scrollIntoView({ behavior: "smooth", block: "center" });
+        const email = $("pro-email");
+        if (email) window.setTimeout(() => email.focus({ preventScroll: true }), 350);
+      }
+    });
+    updateTopbarAuth();
     async function runLookup() {
       const number = $("lookup-number").value.trim();
       if (!number) return setStatus("lookup-status", "Enter a number to scan.", true);
@@ -2086,6 +2115,7 @@ INDEX_HTML = r"""<!doctype html>
         if (!data.pro) throw new Error("This account does not have Pro access.");
         state.proEmail = data.email;
         state.proTier = data.tier || "pro";
+        updateTopbarAuth();
         $("session-pro-user").textContent = data.email + " (" + state.proTier + ")";
         $("tier-badge").textContent = state.proTier === "pro_plus" ? "PRO+" : "PRO";
         $("pro-login-form").style.display = "none";
@@ -2102,6 +2132,7 @@ INDEX_HTML = r"""<!doctype html>
     $("pro-signout-button").addEventListener("click", () => {
       state.proEmail = null;
       state.proTier = null;
+      updateTopbarAuth();
       $("apikey-section").style.display = "none";
       $("apikey-new").textContent = "";
       $("session-pro-user").textContent = "Not signed in";
