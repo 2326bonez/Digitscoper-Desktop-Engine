@@ -13,8 +13,9 @@ Run the native desktop window:
 Build a standalone desktop executable:
     pyinstaller --noconfirm --clean --onefile --name Digitscoper main.py
 
-The database is created next to this file as digitscoper.db. The seeded Pro
-account is ronald@example.com / password123. Set ADMIN_PASSWORD in the
+The database is created next to this file as digitscoper.db. Development seed
+accounts are only created when ALLOW_DEV_SEED=1 is set in the environment;
+they are never created in production. Set ADMIN_PASSWORD in the
 environment before sharing the application to replace the development admin
 password (admin123).
 """
@@ -210,6 +211,13 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 last_used TEXT
             );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                email TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email);
             """
         )
         # --- tier column migration (replaces boolean is_pro) ---
@@ -222,6 +230,8 @@ def init_db() -> None:
             # migrate legacy is_pro flag -> tier
             db.execute("UPDATE users SET tier = 'pro' WHERE is_pro = 1")
             db.execute("UPDATE users SET tier = 'free' WHERE is_pro = 0 OR tier IS NULL OR tier = ''")
+        if "password_setup_required" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN password_setup_required INTEGER NOT NULL DEFAULT 0")
         saved_number_columns = {
             row["name"]
             for row in db.execute("PRAGMA table_info(saved_numbers)").fetchall()
@@ -235,19 +245,127 @@ def init_db() -> None:
         }
         if "area_code" not in saved_pattern_columns:
             db.execute("ALTER TABLE saved_patterns ADD COLUMN area_code TEXT")
-        if db.execute(
-            "SELECT 1 FROM users WHERE email = ?", ("ronald@example.com",)
-        ).fetchone() is None:
-            db.execute(
-                """
-                INSERT INTO users (email, password, is_pro, tier, created_at)
-                VALUES (?, ?, 1, 'pro', ?)
-                """,
-                ("ronald@example.com", hash_password("password123"), utc_now()),
-            )
+        # --- development seed account: NEVER in production ---
+        # The seed Pro account is only created when ALLOW_DEV_SEED=1. On
+        # production the account is disabled if it somehow exists (demoted to
+        # free with a randomized password) so a published credential can never
+        # grant Pro access.
+        if os.environ.get("ALLOW_DEV_SEED") == "1":
+            if db.execute(
+                "SELECT 1 FROM users WHERE email = ?", ("ronald@example.com",)
+            ).fetchone() is None:
+                db.execute(
+                    """
+                    INSERT INTO users (email, password, is_pro, tier, created_at)
+                    VALUES (?, ?, 1, 'pro', ?)
+                    """,
+                    ("ronald@example.com", hash_password("password123"), utc_now()),
+                )
+        else:
+            seed_row = db.execute(
+                "SELECT tier FROM users WHERE email = ?", ("ronald@example.com",)
+            ).fetchone()
+            if seed_row is not None and (seed_row["tier"] or "") != TIER_FREE:
+                db.execute(
+                    "UPDATE users SET tier = ?, is_pro = 0, password = ?, "
+                    "password_setup_required = 0 WHERE email = ?",
+                    (TIER_FREE, hash_password(secrets.token_hex(32)), "ronald@example.com"),
+                )
+                db.execute(
+                    "DELETE FROM sessions WHERE email = ?", ("ronald@example.com",)
+                )
+                print(
+                    "[security] disabled development seed account "
+                    "ronald@example.com (demoted to free, password randomized)"
+                )
 
 
 init_db()
+
+
+# =====================================================================
+# PRO SESSION TOKENS
+# =====================================================================
+# Pro/Pro+ endpoints authenticate with a Bearer session token issued at
+# /api/pro/login. The token is a random secret; only its SHA-256 hash is
+# stored. Identity is always derived server-side from the token — a
+# client-supplied email address is never trusted for authorization.
+
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(30 * 24 * 3600)))
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_session(email: str) -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires = now.timestamp() + SESSION_TTL_SECONDS
+    with connection() as db:
+        db.execute(
+            "INSERT INTO sessions (token_hash, email, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                _hash_token(token),
+                email.strip().lower(),
+                now.isoformat(timespec="seconds"),
+                datetime.fromtimestamp(expires, tz=timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+    return token
+
+
+def destroy_session(token: str) -> None:
+    with connection() as db:
+        db.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash_token(token),))
+
+
+def _session_email(request: Request) -> str:
+    """Validate the Bearer session token; return the account email.
+
+    Raises 401 for missing/invalid/expired tokens. Tier is re-read from the
+    users table on every call so downgrades take effect immediately.
+    """
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing session token.")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing session token.")
+    with connection() as db:
+        row = db.execute(
+            "SELECT email, expires_at FROM sessions WHERE token_hash = ?",
+            (_hash_token(token),),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=401, detail="Invalid session token.")
+    try:
+        expired = datetime.fromisoformat(row["expires_at"]) <= datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        expired = True
+    if expired:
+        destroy_session(token)
+        raise HTTPException(status_code=401, detail="Session expired.")
+    return row["email"]
+
+
+def current_pro_user(request: Request) -> tuple[str, str]:
+    """Dependency: authenticated Pro/Pro+ user. Returns (email, tier)."""
+    email = _session_email(request)
+    tier = get_user_tier(email)
+    if tier not in (TIER_PRO, TIER_PROPLUS):
+        raise HTTPException(status_code=403, detail="Pro access required.")
+    return email, tier
+
+
+def current_proplus_user(request: Request) -> tuple[str, str]:
+    """Dependency: authenticated Pro+ user. Returns (email, tier)."""
+    email = _session_email(request)
+    tier = get_user_tier(email)
+    if tier != TIER_PROPLUS:
+        raise HTTPException(status_code=403, detail="Pro+ access required.")
+    return email, tier
 
 
 class ProLoginRequest(BaseModel):
@@ -256,12 +374,10 @@ class ProLoginRequest(BaseModel):
 
 
 class SaveNumberRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
     number: str = Field(min_length=1, max_length=40)
 
 
 class AutoSaveRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
     number: str = Field(min_length=1, max_length=40)
     carrier: str = Field(default="", max_length=120)
     line_type: str = Field(default="", max_length=40)
@@ -270,7 +386,6 @@ class AutoSaveRequest(BaseModel):
 
 
 class SavePatternRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
     pattern: str = Field(min_length=1, max_length=120)
     area_code: str = Field(default="", max_length=8)
 
@@ -294,17 +409,14 @@ class CheckoutRequest(BaseModel):
 
 
 class BulkLookupRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
     numbers: str = Field(min_length=1, max_length=100000)
 
 
 class FraudNetworkRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
     numbers: str = Field(min_length=1, max_length=100000)
 
 
 class ApiKeyCreateRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
     name: str = Field(default="", max_length=80)
 
 
@@ -319,6 +431,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+    """Add baseline security headers to every response.
+
+    Note: X-Frame-Options is intentionally NOT set to DENY/SAMEORIGIN because
+    the Capacitor native shell embeds this dashboard in an iframe; framing
+    protection would break the mobile app. API responses are JSON and the
+    dashboard escapes all user content.
+    """
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 
 def normalize_number(number: str) -> str:
@@ -703,9 +830,9 @@ def history() -> dict[str, Any]:
 
 @app.delete("/history")
 @app.delete("/api/history")
-def clear_history(password: str = Query(..., min_length=1)) -> dict[str, Any]:
+def clear_history(request: Request) -> dict[str, Any]:
     """Clear the local lookup history ledger (admin only)."""
-    admin_check(password)
+    admin_check_request(request)
     with connection() as db:
         result = db.execute("DELETE FROM lookups")
         db.commit()
@@ -823,13 +950,101 @@ def pro_login(req: ProLoginRequest) -> dict[str, Any]:
     tier = (row["tier"] or "").strip().lower()
     if tier not in VALID_TIERS:
         tier = TIER_PRO if row["is_pro"] else TIER_FREE
-    return {"status": "ok", "pro": tier in (TIER_PRO, TIER_PROPLUS), "tier": tier, "email": req.email}
+    if tier not in (TIER_PRO, TIER_PROPLUS):
+        raise HTTPException(status_code=403, detail="This account does not have Pro access.")
+    token = create_session(req.email)
+    return {
+        "status": "ok",
+        "pro": True,
+        "tier": tier,
+        "email": req.email.strip().lower(),
+        "token": token,
+    }
+
+
+class ProLogoutRequest(BaseModel):
+    token: str = Field(min_length=10, max_length=256)
+
+
+@app.post("/pro/logout")
+@app.post("/api/pro/logout")
+def pro_logout(request: Request, req: Optional[ProLogoutRequest] = None) -> dict[str, Any]:
+    """Revoke the current session token (Authorization header preferred)."""
+    authorization = request.headers.get("authorization", "")
+    token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    if not token and req is not None:
+        token = req.token.strip()
+    if token:
+        destroy_session(token)
+    return {"status": "signed_out"}
+
+
+class ProSetPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    session_id: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+@app.post("/pro/set_password")
+@app.post("/api/pro/set_password")
+def pro_set_password(req: ProSetPasswordRequest) -> dict[str, Any]:
+    """Let a new Stripe subscriber set their password.
+
+    Proof of ownership is the Stripe checkout session ID from the success
+    redirect URL: the session is retrieved from Stripe and must be paid and
+    addressed to the same email. Only accounts flagged password_setup_required
+    (created by the webhook) may use this flow.
+    """
+    if not _stripe_ready():
+        raise HTTPException(status_code=503, detail="Stripe is not configured.")
+    email = req.email.strip().lower()
+    with connection() as db:
+        row = db.execute(
+            "SELECT password_setup_required, tier, is_pro FROM users WHERE lower(email) = lower(?)",
+            (email,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Account not found.")
+    if not row["password_setup_required"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Password is already set. Use the Pro tab to sign in.",
+        )
+    try:
+        checkout = stripe.checkout.Session.retrieve(req.session_id.strip())  # type: ignore[union-attr]
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Could not verify checkout session: {error}") from error
+    session_data = _stripe_object_dict(checkout)
+    if session_data.get("payment_status") != "paid":
+        raise HTTPException(status_code=402, detail="Checkout session is not paid.")
+    metadata = _stripe_object_dict(session_data.get("metadata", {}))
+    customer_details = _stripe_object_dict(session_data.get("customer_details", {}))
+    session_email = (
+        metadata.get("email")
+        or session_data.get("customer_email")
+        or customer_details.get("email")
+        or ""
+    ).strip().lower()
+    if session_email != email:
+        raise HTTPException(status_code=403, detail="Checkout session does not match this email.")
+    tier = (row["tier"] or "").strip().lower()
+    if tier not in VALID_TIERS:
+        tier = TIER_PRO if row["is_pro"] else TIER_FREE
+    with connection() as db:
+        db.execute(
+            "UPDATE users SET password = ?, password_setup_required = 0 "
+            "WHERE lower(email) = lower(?)",
+            (hash_password(req.new_password), email),
+        )
+        db.execute("DELETE FROM sessions WHERE email = ?", (email,))
+    token = create_session(email)
+    return {"status": "password_set", "email": email, "tier": tier, "token": token}
 
 
 @app.post("/pro/save_number")
 @app.post("/api/pro/save_number")
-def save_number(req: SaveNumberRequest) -> dict[str, Any]:
-    require_pro(req.email)
+def save_number(req: SaveNumberRequest, request: Request) -> dict[str, Any]:
+    email, _tier = current_pro_user(request)
     record = lookup_record(req.number)
     with connection() as db:
         db.execute(
@@ -844,7 +1059,7 @@ def save_number(req: SaveNumberRequest) -> dict[str, Any]:
                 business_name = excluded.business_name
             """,
             (
-                req.email,
+                email,
                 record["number"],
                 record["carrier"]["name"],
                 record["carrier"]["line_type"],
@@ -853,13 +1068,29 @@ def save_number(req: SaveNumberRequest) -> dict[str, Any]:
                 utc_now(),
             ),
         )
-    return dashboard_data(req.email)
+    return dashboard_data(email)
+
+
+@app.delete("/pro/delete_number/{number}")
+@app.delete("/api/pro/delete_number/{number}")
+def delete_number(number: str, request: Request) -> dict[str, Any]:
+    """Delete one of the authenticated user's saved numbers."""
+    email, _tier = current_pro_user(request)
+    normalized = normalize_number(number)
+    with connection() as db:
+        cursor = db.execute(
+            "DELETE FROM saved_numbers WHERE lower(user_email) = lower(?) AND number = ?",
+            (email, normalized),
+        )
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Saved number not found.")
+    return {"status": "deleted", **dashboard_data(email)}
 
 
 @app.post("/pro/auto_save")
 @app.post("/api/pro/auto_save")
-def auto_save(req: AutoSaveRequest) -> dict[str, Any]:
-    require_pro(req.email)
+def auto_save(req: AutoSaveRequest, request: Request) -> dict[str, Any]:
+    email, _tier = current_pro_user(request)
     normalized = normalize_number(req.number)
     with connection() as db:
         db.execute(
@@ -874,7 +1105,7 @@ def auto_save(req: AutoSaveRequest) -> dict[str, Any]:
                 business_name = excluded.business_name
             """,
             (
-                req.email,
+                email,
                 normalized,
                 req.carrier.strip(),
                 req.line_type.strip(),
@@ -883,13 +1114,13 @@ def auto_save(req: AutoSaveRequest) -> dict[str, Any]:
                 utc_now(),
             ),
         )
-    return {"status": "synchronized", **dashboard_data(req.email)}
+    return {"status": "synchronized", **dashboard_data(email)}
 
 
 @app.post("/pro/save_pattern")
 @app.post("/api/pro/save_pattern")
-def save_pattern(req: SavePatternRequest) -> dict[str, Any]:
-    require_pro(req.email)
+def save_pattern(req: SavePatternRequest, request: Request) -> dict[str, Any]:
+    email, _tier = current_pro_user(request)
     pattern = req.pattern.strip()
     if not pattern:
         raise HTTPException(status_code=400, detail="Pattern cannot be empty.")
@@ -900,14 +1131,15 @@ def save_pattern(req: SavePatternRequest) -> dict[str, Any]:
             VALUES (?, ?, ?, ?)
             ON CONFLICT(user_email, pattern) DO UPDATE SET area_code = excluded.area_code
             """,
-            (req.email, pattern, req.area_code.strip(), utc_now()),
+            (email, pattern, req.area_code.strip(), utc_now()),
         )
-    return dashboard_data(req.email)
+    return dashboard_data(email)
 
 
 @app.get("/pro/dashboard")
 @app.get("/api/pro/dashboard")
-def pro_dashboard(email: str = Query(..., min_length=3)) -> dict[str, Any]:
+def pro_dashboard(request: Request) -> dict[str, Any]:
+    email, _tier = current_pro_user(request)
     return dashboard_data(email)
 
 
@@ -919,10 +1151,19 @@ def admin_check(password: str) -> None:
         raise HTTPException(status_code=403, detail="Invalid admin password.")
 
 
+def admin_check_request(request: Request) -> None:
+    """Authenticate an admin request via the X-Admin-Password header.
+
+    Credentials are never accepted in URL query strings (they leak into
+    access logs, proxies, and browser history).
+    """
+    admin_check(request.headers.get("x-admin-password", ""))
+
+
 @app.get("/admin/db")
 @app.get("/api/admin/db")
-def admin_db(password: str = Query(..., min_length=1)) -> dict[str, Any]:
-    admin_check(password)
+def admin_db(request: Request) -> dict[str, Any]:
+    admin_check_request(request)
     with connection() as db:
         rows = db.execute(
             "SELECT * FROM lookups ORDER BY last_seen DESC"
@@ -1083,7 +1324,8 @@ def stripe_create_checkout(req: CheckoutRequest) -> dict[str, Any]:
             customer_email=email,
             line_items=[{"price": price_id, "quantity": 1}],
             metadata={"email": email, "tier": tier},
-            success_url=os.environ.get("STRIPE_SUCCESS_URL", base_url + "/") + "?checkout=success",
+            success_url=os.environ.get("STRIPE_SUCCESS_URL", base_url + "/")
+            + "?checkout=success&session_id={CHECKOUT_SESSION_ID}",
             cancel_url=os.environ.get("STRIPE_CANCEL_URL", base_url + "/") + "?checkout=cancelled",
         )
     except Exception as error:
@@ -1142,11 +1384,14 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
                 if exists:
                     set_user_tier(email, tier)
                 else:
-                    # create the account on first successful payment; user sets
-                    # password via admin or a future self-serve flow
+                    # Create the account on first successful payment. The
+                    # password is a random placeholder; the customer sets a
+                    # real password via /api/pro/set_password, which verifies
+                    # the Stripe checkout session before allowing it.
                     db.execute(
-                        "INSERT INTO users (email, password, is_pro, tier, created_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO users (email, password, is_pro, tier, "
+                        "password_setup_required, created_at) "
+                        "VALUES (?, ?, ?, ?, 1, ?)",
                         (email, hash_password(secrets.token_hex(16)), 1, tier, utc_now()),
                     )
         return {"status": "fulfilled", "email": email, "tier": tier}
@@ -1190,8 +1435,9 @@ def _pro_saved_numbers(email: str) -> list[dict[str, Any]]:
 
 @app.get("/pro/export/csv")
 @app.get("/api/pro/export/csv")
-def pro_export_csv(email: str = Query(..., min_length=3)) -> Response:
+def pro_export_csv(request: Request) -> Response:
     """Download the Pro user's saved numbers as CSV."""
+    email, _tier = current_pro_user(request)
     rows = _pro_saved_numbers(email)
     buffer = io.StringIO()
     writer = csv.DictWriter(
@@ -1279,9 +1525,9 @@ def _render_pdf(rows: list[dict[str, Any]], email: str, tier: str) -> bytes:
 
 @app.get("/pro/export/pdf")
 @app.get("/api/pro/export/pdf")
-def pro_export_pdf(email: str = Query(..., min_length=3)) -> Response:
+def pro_export_pdf(request: Request) -> Response:
     """Download the Pro user's saved numbers as a PDF report."""
-    tier = require_pro(email)
+    email, tier = current_pro_user(request)
     rows = _pro_saved_numbers(email)
     pdf_bytes = _render_pdf(rows, email, tier)
     return Response(
@@ -1297,9 +1543,9 @@ def pro_export_pdf(email: str = Query(..., min_length=3)) -> Response:
 
 @app.post("/pro/bulk_lookup")
 @app.post("/api/pro/bulk_lookup")
-def pro_bulk_lookup(req: BulkLookupRequest) -> dict[str, Any]:
+def pro_bulk_lookup(req: BulkLookupRequest, request: Request) -> dict[str, Any]:
     """Run live lookups across a batch of numbers. Pro: 50/batch, Pro+: 200/batch."""
-    tier = require_pro(req.email)
+    email, tier = current_pro_user(request)
     limit = 200 if tier == TIER_PROPLUS else 50
     accepted, rejected = parse_bulk_targets(req.numbers)
     batch = accepted[:limit]
@@ -1361,13 +1607,13 @@ def _number_attributes(record: dict[str, Any]) -> dict[str, str]:
 
 @app.post("/proplus/fraud_network")
 @app.post("/api/proplus/fraud_network")
-def proplus_fraud_network(req: FraudNetworkRequest) -> dict[str, Any]:
+def proplus_fraud_network(req: FraudNetworkRequest, request: Request) -> dict[str, Any]:
     """Flagship Pro+ feature: detect linked fraud networks across a batch.
 
     Numbers sharing 2+ attributes (carrier, region/state, risk label,
     line type, area code) are linked; connected components become clusters.
     """
-    require_proplus(req.email)
+    _email, _tier = current_proplus_user(request)
     accepted, rejected = parse_bulk_targets(req.numbers)
     batch = accepted[:200]
 
@@ -1518,9 +1764,9 @@ async def _bearer_user(request: Request) -> dict[str, Any]:
 
 @app.post("/proplus/api_keys")
 @app.post("/api/proplus/api_keys")
-def proplus_create_api_key(req: ApiKeyCreateRequest) -> dict[str, Any]:
+def proplus_create_api_key(req: ApiKeyCreateRequest, request: Request) -> dict[str, Any]:
     """Generate a new API key. The plain key is returned ONCE."""
-    require_proplus(req.email)
+    email, _tier = current_proplus_user(request)
     plain_key = "dsk_live_" + secrets.token_urlsafe(32)
     key_hash = _hash_api_key(plain_key)
     name = req.name.strip() or f"Key {utc_now()[:10]}"
@@ -1530,7 +1776,7 @@ def proplus_create_api_key(req: ApiKeyCreateRequest) -> dict[str, Any]:
             INSERT INTO api_keys (key_hash, key_prefix, user_email, name, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (key_hash, plain_key[:12] + "...", req.email.strip().lower(), name, utc_now()),
+            (key_hash, plain_key[:12] + "...", email, name, utc_now()),
         )
         key_id = cursor.lastrowid
     return {
@@ -1544,9 +1790,9 @@ def proplus_create_api_key(req: ApiKeyCreateRequest) -> dict[str, Any]:
 
 @app.get("/proplus/api_keys")
 @app.get("/api/proplus/api_keys")
-def proplus_list_api_keys(email: str = Query(..., min_length=3)) -> dict[str, Any]:
+def proplus_list_api_keys(request: Request) -> dict[str, Any]:
     """List API keys (masked) for a Pro+ user."""
-    require_proplus(email)
+    email, _tier = current_proplus_user(request)
     with connection() as db:
         rows = db.execute(
             """
@@ -1561,9 +1807,9 @@ def proplus_list_api_keys(email: str = Query(..., min_length=3)) -> dict[str, An
 
 @app.delete("/proplus/api_keys/{key_id}")
 @app.delete("/api/proplus/api_keys/{key_id}")
-def proplus_delete_api_key(key_id: int, email: str = Query(..., min_length=3)) -> dict[str, Any]:
+def proplus_delete_api_key(key_id: int, request: Request) -> dict[str, Any]:
     """Revoke an API key."""
-    require_proplus(email)
+    email, _tier = current_proplus_user(request)
     with connection() as db:
         cursor = db.execute(
             "DELETE FROM api_keys WHERE id = ? AND lower(user_email) = lower(?)",
@@ -1841,6 +2087,13 @@ INDEX_HTML = r"""<!doctype html>
             <label for="pro-password">Password</label><input id="pro-password" type="password" placeholder="Your password">
             <button id="pro-login-button" class="btn btn-primary">Unlock Pro</button>
           </div>
+          <div id="pro-setup-form" class="form-stack" style="display:none">
+            <h3>Set your Pro password</h3>
+            <p class="hint">Your subscription is active. Choose a password to unlock your Pro workspace.</p>
+            <label for="setup-email">Email</label><input id="setup-email" type="email" placeholder="you@example.com">
+            <label for="setup-password">New password</label><input id="setup-password" type="password" placeholder="At least 8 characters">
+            <button id="pro-setup-button" class="btn btn-primary">Set password &amp; sign in</button>
+          </div>
           <div id="pro-status" class="status" role="status"></div>
           <div id="pro-content" class="dashboard" style="display:none">
             <div class="eyebrow">Saved intelligence</div>
@@ -1985,7 +2238,29 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <script>
     const API_BASE = window.location.pathname.startsWith("/api") ? "/api" : "";
-    const state = { proEmail: null, proTier: null, lastRecord: null };
+    const state = { proEmail: null, proTier: null, proToken: null, lastRecord: null };
+    // Restore a previous Pro session (token only; identity is re-validated server-side).
+    try {
+      const saved = JSON.parse(localStorage.getItem("digitscoper_pro") || "null");
+      if (saved && saved.token) {
+        state.proToken = saved.token;
+        state.proEmail = saved.email || null;
+        state.proTier = saved.tier || null;
+      }
+    } catch (error) { /* storage unavailable */ }
+    function persistProSession() {
+      try {
+        if (state.proToken) {
+          localStorage.setItem("digitscoper_pro", JSON.stringify({ token: state.proToken, email: state.proEmail, tier: state.proTier }));
+        } else {
+          localStorage.removeItem("digitscoper_pro");
+        }
+      } catch (error) { /* storage unavailable */ }
+    }
+    function clearProSession() {
+      state.proEmail = null; state.proTier = null; state.proToken = null;
+      persistProSession();
+    }
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;" })[c]);
     const jsonLabel = (value) => esc(JSON.stringify(value, null, 2));
@@ -1997,8 +2272,18 @@ INDEX_HTML = r"""<!doctype html>
       const element = $(id); element.textContent = message; element.classList.toggle("error", error);
     }
     async function request(path, options = {}) {
-      const response = await fetch(API_BASE + path, { headers: { "Content-Type": "application/json" }, ...options });
+      const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+      if (state.proToken) headers["Authorization"] = "Bearer " + state.proToken;
+      const response = await fetch(API_BASE + path, { ...options, headers });
       const body = await response.json().catch(() => ({}));
+      if (response.status === 401 && state.proToken && path.startsWith("/pro")) {
+        // Session expired or revoked — drop local state so the user can sign in again.
+        clearProSession(); updateTopbarAuth();
+        $("session-pro-user").textContent = "Not signed in";
+        $("pro-login-form").style.display = "grid";
+        $("pro-content").style.display = "none";
+        throw new Error("Session expired. Please sign in again.");
+      }
       if (!response.ok) throw new Error(body.detail || "Request failed");
       return body;
     }
@@ -2051,6 +2336,26 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
     updateTopbarAuth();
+    // If a session token survived a reload, validate it against the server
+    // (identity comes from the token, never from local state).
+    (async () => {
+      if (!state.proToken) return;
+      try {
+        const data = await request("/pro/dashboard");
+        state.proEmail = data.email;
+        state.proTier = data.tier;
+        persistProSession();
+        updateTopbarAuth();
+        $("session-pro-user").textContent = data.email + " (" + state.proTier + ")";
+        $("tier-badge").textContent = state.proTier === "pro_plus" ? "PRO+" : "PRO";
+        $("pro-login-form").style.display = "none";
+        await refreshDashboard();
+        if (state.proTier === "pro_plus") {
+          $("apikey-section").style.display = "block";
+          await refreshApiKeys();
+        }
+      } catch (error) { /* token invalid — already cleared by request() */ }
+    })();
     async function runLookup() {
       const number = $("lookup-number").value.trim();
       if (!number) return setStatus("lookup-status", "Enter a number to scan.", true);
@@ -2076,7 +2381,6 @@ INDEX_HTML = r"""<!doctype html>
         if (state.proEmail) {
           try {
             await request("/pro/auto_save", { method: "POST", body: JSON.stringify({
-              email: state.proEmail,
               number: data.number,
               carrier: data.carrier.name,
               line_type: data.carrier.line_type,
@@ -2096,7 +2400,7 @@ INDEX_HTML = r"""<!doctype html>
     $("lookup-button").addEventListener("click", runLookup);
     $("lookup-number").addEventListener("keydown", (event) => { if (event.key === "Enter") runLookup(); });
     async function refreshDashboard() {
-      const data = await request("/pro/dashboard?email=" + encodeURIComponent(state.proEmail));
+      const data = await request("/pro/dashboard");
       $("pro-content").style.display = "block";
       $("saved-number-count").textContent = data.analytics.total_saved_numbers;
       $("saved-pattern-count").textContent = data.analytics.total_saved_patterns;
@@ -2104,17 +2408,25 @@ INDEX_HTML = r"""<!doctype html>
         const number = esc(item.number);
         const carrier = esc(item.carrier || "Unknown");
         const business = esc(item.business_name || "None");
-        const deletePath = API_BASE + "/pro/delete_number/" + encodeURIComponent(state.proEmail) + "/" + encodeURIComponent(item.number);
-        return "<div class='data-card' style='display:flex; align-items:center; justify-content:space-between; gap:12px'><div style='text-align:left;'><strong style='font-family:monospace;'>" + number + "</strong><div style='font-size:11px; color:#64748b; margin-top:2px;'>" + carrier + " &middot; <span style='color:#34d399;'>" + business + "</span></div></div><button class='btn-danger' style='padding:4px 8px; font-size:11px;' onclick=\"if(confirm('Delete?')) fetch('" + deletePath + "', {method:'DELETE'}).then(() => refreshDashboard())\">Delete</button></div>";
+        return "<div class='data-card' style='display:flex; align-items:center; justify-content:space-between; gap:12px'><div style='text-align:left;'><strong style='font-family:monospace;'>" + number + "</strong><div style='font-size:11px; color:#64748b; margin-top:2px;'>" + carrier + " &middot; <span style='color:#34d399;'>" + business + "</span></div></div><button class='btn-danger' style='padding:4px 8px; font-size:11px;' onclick=\"if(confirm('Delete?')) deleteSavedNumber('" + number + "')\">Delete</button></div>";
       }).join("") : "<span class='empty'>No numbers saved yet.</span>";
       $("saved-patterns").innerHTML = data.saved_patterns.length ? data.saved_patterns.map((item) => "<span class='pill'>" + esc(item.pattern) + (item.area_code ? " · " + esc(item.area_code) : "") + "</span>").join("") : "<span class='empty'>No patterns saved yet.</span>";
+    }
+    async function deleteSavedNumber(number) {
+      try {
+        await request("/pro/delete_number/" + encodeURIComponent(number), { method: "DELETE" });
+        await refreshDashboard();
+      } catch (error) { setStatus("pro-status", error.message, true); }
     }
     $("pro-login-button").addEventListener("click", async () => {
       try {
         const data = await request("/pro/login", { method: "POST", body: JSON.stringify({ email: $("pro-email").value.trim(), password: $("pro-password").value }) });
         if (!data.pro) throw new Error("This account does not have Pro access.");
+        if (!data.token) throw new Error("Sign-in failed. Please try again.");
         state.proEmail = data.email;
         state.proTier = data.tier || "pro";
+        state.proToken = data.token;
+        persistProSession();
         updateTopbarAuth();
         $("session-pro-user").textContent = data.email + " (" + state.proTier + ")";
         $("tier-badge").textContent = state.proTier === "pro_plus" ? "PRO+" : "PRO";
@@ -2129,9 +2441,11 @@ INDEX_HTML = r"""<!doctype html>
         }
       } catch (error) { setStatus("pro-status", error.message, true); }
     });
-    $("pro-signout-button").addEventListener("click", () => {
-      state.proEmail = null;
-      state.proTier = null;
+    $("pro-signout-button").addEventListener("click", async () => {
+      try {
+        await request("/pro/logout", { method: "POST" });
+      } catch (error) { /* best effort */ }
+      clearProSession();
       updateTopbarAuth();
       $("apikey-section").style.display = "none";
       $("apikey-new").textContent = "";
@@ -2143,7 +2457,7 @@ INDEX_HTML = r"""<!doctype html>
     });
     $("save-number-button").addEventListener("click", async () => {
       try {
-        await request("/pro/save_number", { method: "POST", body: JSON.stringify({ email: state.proEmail, number: $("save-number").value.trim() }) });
+        await request("/pro/save_number", { method: "POST", body: JSON.stringify({ number: $("save-number").value.trim() }) });
         $("save-number").value = ""; setStatus("pro-status", "Number saved."); await refreshDashboard();
       } catch (error) { setStatus("pro-status", error.message, true); }
     });
@@ -2151,7 +2465,7 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const pattern = $("save-pattern").value.trim();
         const areaCode = pattern.match(/\b(\d{3})\b/)?.[1] || "";
-        await request("/pro/save_pattern", { method: "POST", body: JSON.stringify({ email: state.proEmail, pattern, area_code: areaCode }) });
+        await request("/pro/save_pattern", { method: "POST", body: JSON.stringify({ pattern, area_code: areaCode }) });
         $("save-pattern").value = ""; setStatus("pro-status", "Pattern saved."); await refreshDashboard();
       } catch (error) { setStatus("pro-status", error.message, true); }
     });
@@ -2181,7 +2495,6 @@ INDEX_HTML = r"""<!doctype html>
       }));
       try {
         await request("/pro/save_pattern", { method: "POST", body: JSON.stringify({
-          email: state.proEmail,
           pattern: scope + "-xxx-" + suffix,
           area_code: areaCode === "ALL" ? stateCode : areaCode
         }) });
@@ -2190,9 +2503,14 @@ INDEX_HTML = r"""<!doctype html>
       } catch (error) { setStatus("pro-status", error.message, true); }
     }
     $("pattern-generate-button").addEventListener("click", generateSuffixCombinations);
+    // Admin requests authenticate via the X-Admin-Password header —
+    // credentials never travel in URL query strings.
+    function adminHeaders() {
+      return { "X-Admin-Password": $("admin-password").value };
+    }
     $("admin-load-button").addEventListener("click", async () => {
       try {
-        const data = await request("/admin/db?password=" + encodeURIComponent($("admin-password").value), { headers: {} });
+        const data = await request("/admin/db", { headers: adminHeaders() });
         setStatus("admin-status", "Loaded " + data.total_numbers + " lookup records.");
         $("admin-output").innerHTML = data.numbers.length ? data.numbers.map((item) => "<div class='db-row'><span>" + esc(item.number) + "</span><span>" + item.lookup_count + " scans</span></div>").join("") : "<div class='empty'>No lookup records yet.</div>";
       } catch (error) { setStatus("admin-status", error.message, true); }
@@ -2222,24 +2540,40 @@ INDEX_HTML = r"""<!doctype html>
           "</div><div class='hint' style='margin-top:10px'>" + esc(data.note) + "</div>" +
           "<div style='margin-top:10px'><h3>Validation output</h3>" + rejected + "</div>";
         setStatus("admin-status", "Processed " + data.submitted + " batch entries.");
-        const refreshed = await request("/admin/db?password=" + encodeURIComponent($("admin-password").value), { headers: {} });
+        const refreshed = await request("/admin/db", { headers: adminHeaders() });
         $("admin-output").innerHTML = refreshed.numbers.length ? refreshed.numbers.map((item) => "<div class='db-row'><span>" + esc(item.number) + "</span><span>" + item.lookup_count + " scans</span></div>").join("") : "<div class='empty'>No lookup records yet.</div>";
       } catch (error) { setStatus("admin-status", error.message, true); }
     });
     // ---------- Premium: exports ----------
-    $("export-csv-button").addEventListener("click", () => {
-      if (!state.proEmail) return setStatus("pro-status", "Sign in first.", true);
-      window.location.href = API_BASE + "/pro/export/csv?email=" + encodeURIComponent(state.proEmail);
-    });
-    $("export-pdf-button").addEventListener("click", () => {
-      if (!state.proEmail) return setStatus("pro-status", "Sign in first.", true);
-      window.location.href = API_BASE + "/pro/export/pdf?email=" + encodeURIComponent(state.proEmail);
-    });
+    async function downloadExport(format) {
+      if (!state.proToken) return setStatus("pro-status", "Sign in first.", true);
+      try {
+        setStatus("pro-status", "Preparing " + format.toUpperCase() + " export...");
+        const headers = { "Authorization": "Bearer " + state.proToken };
+        const response = await fetch(API_BASE + "/pro/export/" + format, { headers });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail || "Export failed");
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "digitscoper-pro-export." + format;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(url);
+        setStatus("pro-status", format.toUpperCase() + " export downloaded.");
+      } catch (error) { setStatus("pro-status", error.message, true); }
+    }
+    $("export-csv-button").addEventListener("click", () => downloadExport("csv"));
+    $("export-pdf-button").addEventListener("click", () => downloadExport("pdf"));
 
     // ---------- Premium: tier badge + API keys ----------
     async function refreshApiKeys() {
       try {
-        const data = await request("/proplus/api_keys?email=" + encodeURIComponent(state.proEmail));
+        const data = await request("/proplus/api_keys");
         $("apikey-list").innerHTML = data.keys.length ? data.keys.map((k) =>
           "<div class='pattern-option'><div><strong style='font-family:monospace;'>" + esc(k.key_prefix) + "</strong>" +
           "<div class='hint'>" + esc(k.name) + " · created " + esc(k.created_at) +
@@ -2248,7 +2582,7 @@ INDEX_HTML = r"""<!doctype html>
         ).join("") : "<span class='empty'>No API keys yet.</span>";
         $("apikey-list").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
           if (!confirm("Revoke this API key?")) return;
-          await request("/proplus/api_keys/" + btn.dataset.keyid + "?email=" + encodeURIComponent(state.proEmail), { method: "DELETE" });
+          await request("/proplus/api_keys/" + btn.dataset.keyid, { method: "DELETE" });
           setStatus("pro-status", "API key revoked.");
           await refreshApiKeys();
         }));
@@ -2256,7 +2590,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     $("apikey-create-button").addEventListener("click", async () => {
       try {
-        const data = await request("/proplus/api_keys", { method: "POST", body: JSON.stringify({ email: state.proEmail, name: $("apikey-name").value.trim() }) });
+        const data = await request("/proplus/api_keys", { method: "POST", body: JSON.stringify({ name: $("apikey-name").value.trim() }) });
         $("apikey-new").textContent = "New key (copy now — shown once): " + data.key;
         $("apikey-name").value = "";
         await refreshApiKeys();
@@ -2270,7 +2604,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!numbers) return setStatus("bulk-status", "Paste at least one number.", true);
       setStatus("bulk-status", "Running bulk scan...");
       try {
-        const data = await request("/pro/bulk_lookup", { method: "POST", body: JSON.stringify({ email: state.proEmail, numbers }) });
+        const data = await request("/pro/bulk_lookup", { method: "POST", body: JSON.stringify({ numbers }) });
         setStatus("bulk-status", "Scanned " + data.processed + " of " + data.submitted + " numbers" + (data.truncated ? " (batch limit " + data.limit + ")" : "") + ".");
         $("bulk-results").innerHTML = data.results.length ?
           "<table style='width:100%; border-collapse:collapse; font-size:12px;'><thead><tr style='color:var(--muted); text-align:left;'>" +
@@ -2322,7 +2656,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!numbers) return setStatus("fraud-status", "Paste at least one suspect number.", true);
       setStatus("fraud-status", "Analyzing network links...");
       try {
-        const data = await request("/proplus/fraud_network", { method: "POST", body: JSON.stringify({ email: state.proEmail, numbers }) });
+        const data = await request("/proplus/fraud_network", { method: "POST", body: JSON.stringify({ numbers }) });
         setStatus("fraud-status", "Analyzed " + data.analyzed + " numbers · " + data.cluster_count + " linked cluster" + (data.cluster_count === 1 ? "" : "s") + " · " + data.linked_numbers + " numbers linked.");
         $("fraud-summary").innerHTML =
           "<div class='ingestion-summary'>" +
@@ -2356,6 +2690,47 @@ INDEX_HTML = r"""<!doctype html>
     }
     $("checkout-pro-button").addEventListener("click", () => startCheckout("pro"));
     $("checkout-proplus-button").addEventListener("click", () => startCheckout("pro_plus"));
+
+    // After a successful Stripe checkout the customer lands back with
+    // ?checkout=success&session_id=... — they set their password here
+    // (verified against the paid Stripe session) and are signed straight in.
+    (function handleCheckoutReturn() {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("checkout") === "cancelled") {
+        setStatus("pricing-status", "Checkout was cancelled. No charge was made.", true);
+      }
+      const sessionId = params.get("session_id");
+      if (params.get("checkout") !== "success" || !sessionId) return;
+      goToView("pro");
+      $("pro-login-form").style.display = "none";
+      $("pro-setup-form").style.display = "grid";
+      setStatus("pro-status", "Payment received! Set a password to unlock your Pro workspace.");
+      $("pro-setup-button").addEventListener("click", async () => {
+        const email = $("setup-email").value.trim();
+        const newPassword = $("setup-password").value;
+        if (!email || !newPassword) return setStatus("pro-status", "Enter your email and a new password.", true);
+        if (newPassword.length < 8) return setStatus("pro-status", "Password must be at least 8 characters.", true);
+        try {
+          const data = await request("/pro/set_password", { method: "POST", body: JSON.stringify({ email, session_id: sessionId, new_password: newPassword }) });
+          state.proEmail = data.email;
+          state.proTier = data.tier || "pro";
+          state.proToken = data.token;
+          persistProSession();
+          updateTopbarAuth();
+          $("session-pro-user").textContent = data.email + " (" + state.proTier + ")";
+          $("tier-badge").textContent = state.proTier === "pro_plus" ? "PRO+" : "PRO";
+          $("pro-setup-form").style.display = "none";
+          setStatus("pro-status", "Password set. Pro workspace unlocked.");
+          await refreshDashboard();
+          if (state.proTier === "pro_plus") {
+            $("apikey-section").style.display = "block";
+            await refreshApiKeys();
+          }
+          // Clean the session_id out of the address bar.
+          window.history.replaceState(null, "", window.location.pathname);
+        } catch (error) { setStatus("pro-status", error.message, true); }
+      });
+    })();
 
     loadAreaCodes().catch((error) => setStatus("pro-status", "Area-code catalog unavailable: " + error.message, true));
     $("copyright-year").textContent = new Date().getFullYear();
