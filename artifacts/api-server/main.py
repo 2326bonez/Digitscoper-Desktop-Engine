@@ -1067,7 +1067,10 @@ def _stripe_ready() -> bool:
 def stripe_create_checkout(req: CheckoutRequest) -> dict[str, Any]:
     """Create a Stripe Checkout session for a Pro or Pro+ subscription."""
     if not _stripe_ready():
-        raise HTTPException(status_code=503, detail="Stripe is not configured.")
+        reason = []
+        if not STRIPE_AVAILABLE: reason.append("stripe lib missing")
+        if not STRIPE_SECRET_KEY: reason.append("STRIPE_SECRET_KEY empty")
+        raise HTTPException(status_code=503, detail=f"Stripe is not configured ({', '.join(reason)}).")
     tier = req.tier.strip().lower()
     price_id = {TIER_PRO: STRIPE_PRO_PRICE_ID, TIER_PROPLUS: STRIPE_PROPLUS_PRICE_ID}.get(tier)
     if not price_id:
