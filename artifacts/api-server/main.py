@@ -455,17 +455,28 @@ def _rate_limit_key(request: Request) -> str:
     return "unknown"
 
 
-def _check_rate_limit(request: Request, endpoint: str) -> None:
-    """Raise 429 if the client exceeded the auth rate limit."""
+def _check_rate_limit(
+    request: Request,
+    endpoint: str,
+    max_attempts: int | None = None,
+    window_seconds: int | None = None,
+) -> None:
+    """Raise 429 if the client exceeded the rate limit for the given endpoint.
+
+    max_attempts / window_seconds default to the global auth-limiter env values
+    when not provided, so existing call sites keep their behavior.
+    """
+    limit = max_attempts if max_attempts is not None else _RATE_LIMIT_MAX_ATTEMPTS
+    window = window_seconds if window_seconds is not None else _RATE_LIMIT_WINDOW_SECONDS
     key = f"{endpoint}:{_rate_limit_key(request)}"
     now = time.monotonic()
-    cutoff = now - _RATE_LIMIT_WINDOW_SECONDS
+    cutoff = now - window
     with _rate_limit_lock:
         hits = _rate_limit_hits[key]
         # drop expired entries
         while hits and hits[0] < cutoff:
             hits.pop(0)
-        if len(hits) >= _RATE_LIMIT_MAX_ATTEMPTS:
+        if len(hits) >= limit:
             raise HTTPException(
                 status_code=429,
                 detail="Too many attempts. Please try again later.",
@@ -700,21 +711,120 @@ def live_record(number: str, payload: dict[str, Any], now: str) -> dict[str, Any
     }
 
 
+# PERF-01: IPQS lookup cache — serve the DB-cached record when it is fresher
+# than the TTL instead of making another billable IPQualityScore API call.
+_LOOKUP_CACHE_TTL_SECONDS = int(os.environ.get("LOOKUP_CACHE_TTL_SECONDS", "86400"))
+
+# PRIV-05: data retention — lookup-ledger rows that have not been refreshed
+# within this many days are purged automatically on startup. The shared
+# ledger expires on its own instead of accumulating third-party PII forever.
+# Set to 0 to disable automatic expiry.
+LOOKUP_RETENTION_DAYS = int(os.environ.get("LOOKUP_RETENTION_DAYS", "90"))
+
+
+def prune_expired_lookups() -> int:
+    """Delete lookup rows whose last_seen is older than the retention window.
+
+    Returns the number of rows removed. Rows with unparsable timestamps are
+    left alone (never delete what we cannot age).
+    """
+    if LOOKUP_RETENTION_DAYS <= 0:
+        return 0
+    with connection() as db:
+        cursor = db.execute(
+            "DELETE FROM lookups "
+            "WHERE datetime(REPLACE(last_seen, 'T', ' ')) "
+            "< datetime('now', '-' || ? || ' days')",
+            (LOOKUP_RETENTION_DAYS,),
+        )
+        return cursor.rowcount or 0
+
+
+_pruned_lookup_rows = prune_expired_lookups()
+if _pruned_lookup_rows:
+    print(
+        f"[privacy] pruned {_pruned_lookup_rows} expired lookup row(s) "
+        f"(retention {LOOKUP_RETENTION_DAYS}d)"
+    )
+
+# PERF-02: rate limit on the free /api/lookup endpoint so one client cannot
+# burn through the owner's IPQualityScore quota. 30 requests/minute per IP
+# by default (env-overridable).
+_LOOKUP_RATE_LIMIT_MAX = int(os.environ.get("LOOKUP_RATE_LIMIT_MAX", "30"))
+_LOOKUP_RATE_LIMIT_WINDOW_SECONDS = int(
+    os.environ.get("LOOKUP_RATE_LIMIT_WINDOW_SECONDS", "60")
+)
+
+
+def _parse_utc(ts: Any) -> datetime | None:
+    """Parse a stored UTC timestamp; return None when it cannot be parsed."""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _cached_lookup_record(row: sqlite3.Row, now: str) -> dict[str, Any]:
+    """Rebuild the lookup response shape from a persisted DB row (cache hit)."""
+    carrier = _safe_json(row["carrier"])
+    line_status = {
+        "active": carrier.get("active"),
+        "label": carrier.get("active_status") or "Unknown",
+    }
+    return {
+        "number": row["number"],
+        "carrier": carrier,
+        "line_status": line_status,
+        "spam": _safe_json(row["spam"]),
+        "business": _safe_json(row["business"]),
+        "directories": _safe_json(row["directories"]),
+        "public_records": _safe_json(row["public_records"]),
+        "region": _safe_json(row["region"]),
+        "provider": {"name": "IPQualityScore", "request_id": None},
+        "first_seen": row["first_seen"],
+        "last_seen": now,
+        "lookup_count": row["lookup_count"],
+        "cached": True,
+    }
+
+
 def lookup_record(number: str) -> dict[str, Any]:
     normalized = normalize_number(number)
     now = utc_now()
-    live = live_record(normalized, fetch_ipqs_record(normalized), now)
     with connection() as db:
         row = db.execute(
             "SELECT * FROM lookups WHERE number = ?", (normalized,)
         ).fetchone()
         if row:
-            lookup_count = row["lookup_count"] + 1
+            # PERF-01: serve the cached record when it is fresher than the TTL —
+            # no billable IPQS call, no hard dependency on provider availability.
+            last_seen = _parse_utc(row["last_seen"])
+            if last_seen is not None:
+                age = (datetime.now(timezone.utc) - last_seen).total_seconds()
+                if 0 <= age < _LOOKUP_CACHE_TTL_SECONDS:
+                    # Atomic increment (also fixes PERF-07 on this path).
+                    db.execute(
+                        "UPDATE lookups SET last_seen = ?, lookup_count = lookup_count + 1 "
+                        "WHERE number = ?",
+                        (now, normalized),
+                    )
+                    fresh = db.execute(
+                        "SELECT * FROM lookups WHERE number = ?", (normalized,)
+                    ).fetchone()
+                    return _cached_lookup_record(fresh, now)
+        # Cache miss / stale / unparsable timestamp: fetch live and upsert.
+        live = live_record(normalized, fetch_ipqs_record(normalized), now)
+        if row:
             db.execute(
                 """
                 UPDATE lookups SET carrier = ?, spam = ?, business = ?,
                     directories = ?, public_records = ?, region = ?,
-                    last_seen = ?, lookup_count = ?
+                    last_seen = ?, lookup_count = lookup_count + 1
                 WHERE number = ?
                 """,
                 (
@@ -725,11 +835,20 @@ def lookup_record(number: str) -> dict[str, Any]:
                     json.dumps(live["public_records"]),
                     json.dumps(live["region"]),
                     now,
-                    lookup_count,
                     normalized,
                 ),
             )
-            live.update({"first_seen": row["first_seen"], "last_seen": now, "lookup_count": lookup_count})
+            fresh = db.execute(
+                "SELECT * FROM lookups WHERE number = ?", (normalized,)
+            ).fetchone()
+            live.update(
+                {
+                    "first_seen": fresh["first_seen"],
+                    "last_seen": now,
+                    "lookup_count": fresh["lookup_count"],
+                    "cached": False,
+                }
+            )
             return live
 
         db.execute(
@@ -752,6 +871,7 @@ def lookup_record(number: str) -> dict[str, Any]:
             ),
         )
         live["lookup_count"] = 1
+        live["cached"] = False
         return live
 
 
@@ -842,7 +962,15 @@ def healthz() -> dict[str, str]:
 
 @app.get("/lookup/{number}")
 @app.get("/api/lookup/{number}")
-def lookup(number: str) -> dict[str, Any]:
+def lookup(number: str, request: Request) -> dict[str, Any]:
+    # PERF-02: rate-limit the free lookup endpoint per client IP so one actor
+    # cannot burn through the owner's IPQualityScore quota.
+    _check_rate_limit(
+        request,
+        "api_lookup",
+        max_attempts=_LOOKUP_RATE_LIMIT_MAX,
+        window_seconds=_LOOKUP_RATE_LIMIT_WINDOW_SECONDS,
+    )
     return lookup_record(number)
 
 
@@ -1034,6 +1162,10 @@ class ProLogoutRequest(BaseModel):
     token: str = Field(min_length=10, max_length=256)
 
 
+class DeleteAccountRequest(BaseModel):
+    confirm: bool = False
+
+
 @app.post("/pro/logout")
 @app.post("/api/pro/logout")
 def pro_logout(request: Request, req: Optional[ProLogoutRequest] = None) -> dict[str, Any]:
@@ -1045,6 +1177,50 @@ def pro_logout(request: Request, req: Optional[ProLogoutRequest] = None) -> dict
     if token:
         destroy_session(token)
     return {"status": "signed_out"}
+
+
+# =====================================================================
+# ACCOUNT DELETION (PRIV-04)
+# =====================================================================
+
+@app.delete("/pro/account")
+@app.delete("/api/pro/account")
+def pro_delete_account(req: DeleteAccountRequest, request: Request) -> dict[str, Any]:
+    """Permanently delete the authenticated user's account and personal data.
+
+    Any valid session works (including canceled subscribers demoted to the
+    free tier), because deletion is a privacy right, not a Pro feature.
+
+    Deletes: user row, all sessions, saved numbers, saved patterns, API
+    keys. Scanned numbers live in the shared lookup ledger (a global cache,
+    not per-user data) and are NOT removed here — they expire on their own
+    under the retention policy (PRIV-05).
+    """
+    email = _session_email(request)
+    if not req.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Account deletion requires confirm=true in the request body.",
+        )
+    with connection() as db:
+        deleted = {
+            "api_keys": db.execute(
+                "DELETE FROM api_keys WHERE lower(user_email) = lower(?)", (email,)
+            ).rowcount or 0,
+            "saved_patterns": db.execute(
+                "DELETE FROM saved_patterns WHERE lower(user_email) = lower(?)", (email,)
+            ).rowcount or 0,
+            "saved_numbers": db.execute(
+                "DELETE FROM saved_numbers WHERE lower(user_email) = lower(?)", (email,)
+            ).rowcount or 0,
+            "sessions": db.execute(
+                "DELETE FROM sessions WHERE lower(email) = lower(?)", (email,)
+            ).rowcount or 0,
+            "user": db.execute(
+                "DELETE FROM users WHERE lower(email) = lower(?)", (email,)
+            ).rowcount or 0,
+        }
+    return {"status": "account_deleted", "email": email, "deleted": deleted}
 
 
 class ProSetPasswordRequest(BaseModel):
