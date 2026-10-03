@@ -2326,6 +2326,7 @@ INDEX_HTML = r"""<!doctype html>
             <input id="lookup-number" type="text" inputmode="tel" placeholder="+1 (415) 555-0198" aria-label="Phone number">
             <button id="lookup-button" class="btn btn-primary">Run scan</button>
           </div>
+          <div class="hint" style="margin-top:8px;">&#128274; Provider notice: each scan sends the number to our phone-intelligence provider (<a href="https://www.ipqualityscore.com/privacy-policy" target="_blank" rel="noopener">IPQualityScore</a>) and stores the result in the shared lookup ledger, which expires automatically after 90 days. See the <a href="/privacy">privacy policy</a>.</div>
           <div id="lookup-status" class="status" role="status"></div>
           <div id="lookup-result" class="result">
             <div class="result-head">
@@ -2406,6 +2407,11 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <h3>Numbers</h3><div id="saved-numbers" class="saved-list"></div>
             <h3>Patterns</h3><div id="saved-patterns" class="saved-list"></div>
+            <div class="danger-zone" style="margin-top:22px; padding:16px; border:1px solid #7a2e2e; border-radius:14px; background:rgba(60,20,20,.35);">
+              <h3>&#9888;&#65039; Danger zone</h3>
+              <p class="hint">Permanently delete your account and all saved numbers, patterns, API keys, and sessions. Scanned numbers live in the shared lookup ledger and expire on their own after 90 days. This cannot be undone.</p>
+              <button id="delete-account-button" class="btn" style="background:#a33; color:#fff;">Delete my account</button>
+            </div>
           </div>
         </div>
         <div id="view-bulk" class="view">
@@ -2509,7 +2515,7 @@ INDEX_HTML = r"""<!doctype html>
          <div class="hint"><strong>Privacy by design.</strong><br>Live lookup responses are requested only when you scan a number, then stored in the local SQLite database created beside the app.</div>
       </aside>
     </main>
-    <footer>Digitscoper Desktop Engine <span id="copyright-year"></span> · Secure local utility</footer>
+    <footer>Digitscoper Desktop Engine <span id="copyright-year"></span> · <a href="/privacy" style="color:inherit;">Privacy</a> · <a href="/terms" style="color:inherit;">Terms</a> · Secure local utility</footer>
   </div>
   <script>
     const API_BASE = window.location.pathname.startsWith("/api") ? "/api" : "";
@@ -2748,6 +2754,22 @@ INDEX_HTML = r"""<!doctype html>
       $("pro-content").style.display = "none";
       $("pattern-results").innerHTML = "";
       setStatus("pro-status", "Signed out of the Pro workspace.");
+    });
+    $("delete-account-button").addEventListener("click", async () => {
+      const typed = prompt("Type DELETE to permanently delete your account and all saved data. This cannot be undone:");
+      if (typed !== "DELETE") { setStatus("pro-status", "Account deletion cancelled."); return; }
+      try {
+        await request("/pro/account", { method: "DELETE", body: JSON.stringify({ confirm: true }) });
+      } catch (error) { setStatus("pro-status", error.message, true); return; }
+      clearProSession();
+      updateTopbarAuth();
+      $("apikey-section").style.display = "none";
+      $("apikey-new").textContent = "";
+      $("session-pro-user").textContent = "Not signed in";
+      $("pro-login-form").style.display = "grid";
+      $("pro-content").style.display = "none";
+      $("pattern-results").innerHTML = "";
+      setStatus("pro-status", "Account deleted. All saved data has been removed.");
     });
     $("save-number-button").addEventListener("click", async () => {
       try {
@@ -3047,6 +3069,127 @@ INDEX_HTML = r"""<!doctype html>
   </script>
 </body>
 </html>"""
+
+
+# =====================================================================
+# PRIVACY POLICY + TERMS (PRIV-07)
+# =====================================================================
+# Served as static pages. Content must stay accurate to actual behavior —
+# audit PRIV-02 flags that in-app claims contradict reality; these pages
+# describe what the app really does. Update them whenever data flows change.
+
+PRIVACY_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — Digitscoper</title>
+<style>
+body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #0b111c; color: #dbe4f0; margin: 0; padding: 32px 20px; line-height: 1.6; }
+main { max-width: 720px; margin: 0 auto; }
+h1 { font-size: 28px; } h2 { font-size: 18px; margin-top: 28px; color: #9fd0ff; }
+a { color: #9fd0ff; } .muted { color: #8a97a8; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Digitscoper Privacy Policy</h1>
+<p class="muted">Last updated: October 3, 2026</p>
+
+<h2>What we collect</h2>
+<ul>
+<li><strong>Account data:</strong> your email address, a password hash (never your plain password), and your subscription tier.</li>
+<li><strong>Saved intelligence:</strong> phone numbers and search patterns you choose to save, plus their carrier, line type, region, and business-name metadata.</li>
+<li><strong>Lookup records:</strong> every phone number scanned through Digitscoper, plus the carrier, fraud/risk, region, and business signals returned for it, and scan timestamps/counts. These live in a <strong>shared lookup ledger</strong> used to serve cached results to everyone. Lookups do not require an account, so no account is attached to free scans.</li>
+<li><strong>Sessions &amp; API keys:</strong> only SHA-256 hashes of session tokens and API keys are stored server-side.</li>
+</ul>
+
+<h2>Third parties we share data with</h2>
+<ul>
+<li><strong>IPQualityScore</strong> — our phone-intelligence provider. Every scan sends the phone number being looked up to <a href="https://www.ipqualityscore.com/privacy-policy" target="_blank" rel="noopener">IPQualityScore</a> (number transmitted in the API request; our server's network address is visible to them). There is no other way to provide the service.</li>
+<li><strong>Stripe</strong> — payments. Checkout and subscription handling runs on Stripe; card numbers never touch our servers. We store your email and tier from Stripe's webhook.</li>
+<li><strong>Render / Cloudflare</strong> — hosting and edge delivery; all requests pass through them.</li>
+</ul>
+<p>We do not sell personal data. There are no analytics trackers, advertising pixels, or email-marketing tools in the app.</p>
+
+<h2>Retention</h2>
+<ul>
+<li><strong>Lookup ledger:</strong> rows expire automatically 90 days after their last scan (configurable by the operator).</li>
+<li><strong>Sessions:</strong> expire 30 days after sign-in (or immediately on sign-out).</li>
+<li><strong>Account &amp; saved data:</strong> kept until you delete them. Canceling your subscription downgrades you to the free tier but <strong>does not delete</strong> your account or saved numbers/patterns — delete them separately if you want them gone.</li>
+<li><strong>Stripe records:</strong> subscription and payment records are retained by Stripe for financial-compliance purposes and are not deletable through us.</li>
+</ul>
+
+<h2>Your rights</h2>
+<ul>
+<li><strong>Export:</strong> signed-in Pro users can download saved numbers as CSV or PDF from the Pro workspace.</li>
+<li><strong>Delete saved items:</strong> delete individual saved numbers and patterns from the Pro workspace.</li>
+<li><strong>Delete your account:</strong> use the "Delete my account" button in the Pro workspace, or send an authenticated <code>DELETE /api/pro/account</code> request with <code>{"confirm": true}</code>. This permanently removes your account row, sessions, saved numbers, saved patterns, and API keys. Ledger rows are shared cache data and expire on their own; they are not per-user records.</li>
+<li><strong>Contact:</strong> data requests can also be emailed to <a href="mailto:Bonezthegeneral@bonezlabz.xyz">Bonezthegeneral@bonezlabz.xyz</a>.</li>
+</ul>
+
+<h2>Security</h2>
+<p>Passwords are stored as one-way hashes (bcrypt); session tokens and API keys are stored as SHA-256 hashes only. Traffic is encrypted in transit (TLS). No system is perfectly secure — avoid scanning numbers you do not have a legitimate reason to investigate.</p>
+
+<p><a href="/">← Back to Digitscoper</a></p>
+</main>
+</body>
+</html>"""
+
+TERMS_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terms of Service — Digitscoper</title>
+<style>
+body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #0b111c; color: #dbe4f0; margin: 0; padding: 32px 20px; line-height: 1.6; }
+main { max-width: 720px; margin: 0 auto; }
+h1 { font-size: 28px; } h2 { font-size: 18px; margin-top: 28px; color: #9fd0ff; }
+a { color: #9fd0ff; } .muted { color: #8a97a8; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Digitscoper Terms of Service</h1>
+<p class="muted">Last updated: October 3, 2026</p>
+
+<h2>Acceptable use</h2>
+<p>Use Digitscoper only for legitimate purposes: investigating unknown callers, fraud prevention, and your own business or research needs. Do not use it to stalk, harass, dox, or unlawfully surveil anyone. Phone intelligence is approximate — verify before acting on it.</p>
+
+<h2>Subscriptions</h2>
+<p>Pro ($19/mo) and Pro+ ($49/mo) are billed monthly through Stripe. You can cancel anytime; cancellation takes effect at the end of the billing period and downgrades your account to the free tier. Canceling does not delete your account or saved data — see the <a href="/privacy">privacy policy</a> for deletion.</p>
+
+<h2>Refunds</h2>
+<p>Subscriptions are billed in advance. Contact us within 7 days of a charge for refund consideration.</p>
+
+<h2>Service limits</h2>
+<p>Lookups are rate-limited to protect provider quota. Cached results may be up to 24 hours old. We may change, suspend, or discontinue features at any time.</p>
+
+<h2>Liability</h2>
+<p>The service is provided "as is" without warranties. To the maximum extent allowed by law, Digitscoper is not liable for decisions you make based on lookup results.</p>
+
+<h2>Contact</h2>
+<p><a href="mailto:Bonezthegeneral@bonezlabz.xyz">Bonezthegeneral@bonezlabz.xyz</a></p>
+
+<p><a href="/">← Back to Digitscoper</a></p>
+</main>
+</body>
+</html>"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+@app.get("/api/privacy", response_class=HTMLResponse)
+def privacy_policy() -> HTMLResponse:
+    """Serve the privacy policy (PRIV-07)."""
+    return HTMLResponse(PRIVACY_HTML)
+
+
+@app.get("/terms", response_class=HTMLResponse)
+@app.get("/api/terms", response_class=HTMLResponse)
+def terms_of_service() -> HTMLResponse:
+    """Serve the terms of service (PRIV-07)."""
+    return HTMLResponse(TERMS_HTML)
 
 
 @app.get("/", response_class=HTMLResponse)
