@@ -1077,13 +1077,14 @@ def stripe_create_checkout(req: CheckoutRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Invalid tier. Use 'pro' or 'pro_plus'.")
     email = req.email.strip().lower()
     try:
+        base_url = os.environ.get("APP_BASE_URL", "https://digitscoper.onrender.com").rstrip("/")
         session = stripe.checkout.Session.create(  # type: ignore[union-attr]
             mode="subscription",
             customer_email=email,
             line_items=[{"price": price_id, "quantity": 1}],
             metadata={"email": email, "tier": tier},
-            success_url=os.environ.get("STRIPE_SUCCESS_URL", "/") + "?checkout=success",
-            cancel_url=os.environ.get("STRIPE_CANCEL_URL", "/") + "?checkout=cancelled",
+            success_url=os.environ.get("STRIPE_SUCCESS_URL", base_url + "/") + "?checkout=success",
+            cancel_url=os.environ.get("STRIPE_CANCEL_URL", base_url + "/") + "?checkout=cancelled",
         )
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"Stripe checkout failed: {error}") from error
